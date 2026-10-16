@@ -1,0 +1,64 @@
+{
+  "default_symbol": "000001.SZ",
+  "quote_source": "ths_client",
+  "pretrade_account": true,
+  "session_lock": "runtime/ths-account.lock",
+  "buy_fee_reserve": "5",
+  "accounts": {
+    "broker": {}
+  },
+  "instruments": {
+    "000001.SZ": {
+      "name": "平安银行",
+      "lot_size": 100,
+      "price_tick": "0.01"
+    },
+    "510300.SH": {
+      "name": "沪深300",
+      "lot_size": 100,
+      "price_tick": "0.001"
+    }
+  },
+  "ths_profile": {
+    "account_alias": "broker",
+    "exe_path": "C:\\Path\\To\\THS\\xiadan.exe",
+    "title_regex": "^网上股票交易系统5\\.0.*",
+    "title_contains": [
+      "请填写券商名称",
+      "请替换为交易窗口中的账户尾号片段"
+    ],
+    "caption_identity_box": [
+      0,
+      0,
+      650,
+      26
+    ],
+    "tree_control_id": 129,
+    "grid_control_id": 1047,
+    "grid_class": "CVirtualGridCtrl",
+    "timeout_seconds": 8,
+    "editor_input_mode": "auto",
+    "editor_set_timeout_seconds": 0.3,
+    "ocr_min_confidence": 0.85,
+    "pages": {
+      "buy": [
+        "买入[F1]"
+      ],
+      "sell": [
+        "卖出[F2]"
+      ],
+      "positions": [
+        "查询[F4]",
+        "资金股票"
+      ],
+      "orders": [
+        "查询[F4]",
+        "当日委托"
+      ],
+      "trades": [
+        "查询[F4]",
+        "当日成交"
+      ]
+    }
+  }
+}
