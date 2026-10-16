@@ -15,6 +15,22 @@ class DialogMeaning:
     receipt_binding_verified: bool = False
 
 
+def explicit_submit_rejection(text: str):
+    """Only observed, unambiguous submit failures qualify as terminal evidence.
+
+    The caller must additionally bind this dialog to its own confirmed order.
+    Generic errors, query failures and contradictory success text stay unknown.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    if re.search(r"委托成功|已成功提交|已受理|合同编号|委托编号", text):
+        return None
+    if (re.search(r"提交失败\s*:", text)
+            and re.search(r"(?<![0-9])-150906115(?![0-9])", text)
+            and "低延时98客户不支持夜市" in text):
+        return {"code": "-150906115", "reason": "当前低延时98通道不支持夜市委托"}
+    return None
+
+
 def classify_dialog(title: str, text: str) -> DialogMeaning:
     title = unicodedata.normalize("NFKC", title)
     body = unicodedata.normalize("NFKC", text)

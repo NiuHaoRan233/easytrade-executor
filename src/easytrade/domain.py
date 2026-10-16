@@ -18,8 +18,8 @@ def utc_now() -> datetime:
 
 
 def validate_symbol(symbol):
-    if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", symbol):
-        raise ValidationError("symbol格式必须为六位代码加市场，例如000001.SZ")
+    if not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}(?:\.(SH|SZ|BJ))?", symbol):
+        raise ValidationError("symbol必须为六位证券代码，可附.SH/.SZ/.BJ市场后缀")
     return symbol
 
 

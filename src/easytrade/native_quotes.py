@@ -83,4 +83,4 @@ def parse_panel(result, width, height, symbol, captured_at, *, confidence=0.85):
     return Quote(symbol, bids[0].price or Decimal("0"), asks[0].price or Decimal("0"), observed,
                  last=last, bid_quantity=bids[0].quantity or 0, ask_quantity=asks[0].quantity or 0,
                  session=session_notice(captured_at), source="ths_client", bids=bids, asks=asks,
-                 change_percent=percent, time_kind="client_display_time")
+                 change_percent=percent, time_kind="client_display_time", captured_at=captured_at)

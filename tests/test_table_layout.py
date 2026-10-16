@@ -1,6 +1,7 @@
 """Synthetic grids isolate geometry/column checks without downloading an OCR model."""
 import unittest
 from types import SimpleNamespace
+import sys
 from unittest.mock import patch
 
 import numpy as np
@@ -34,6 +35,23 @@ def sample(scale=1, order=None):
 
 
 class TableLayoutTests(unittest.TestCase):
+    def test_configured_detection_expansion_keeps_boundary_checks(self):
+        image, result = sample()
+        engine = unittest.mock.Mock(return_value=result)
+        factory = unittest.mock.Mock(return_value=engine)
+        reader = OcrTableReader(unclip_ratio=1.2)
+        with patch.dict(sys.modules, {"rapidocr": SimpleNamespace(RapidOCR=factory)}):
+            self.assertEqual(reader.read(image, "positions", "now").rows[0]["position_quantity"], 100)
+            result.boxes[8][1:3, 0] = 310
+            with self.assertRaisesRegex(ValidationError, "跨列"):
+                reader.read(image, "positions", "now")
+        factory.assert_called_once_with(params={"Det.unclip_ratio": 1.2})
+
+    def test_detection_expansion_rejects_invalid_configuration(self):
+        for value in (True, "1.2", 0.9, 2.1, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                OcrTableReader(unclip_ratio=value)
+
     def read(self, image, result):
         reader = OcrTableReader()
         with patch.object(reader, "_recognize", return_value=result):

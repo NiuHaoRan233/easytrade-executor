@@ -6,7 +6,7 @@ from decimal import Decimal
 from threading import Event
 from uuid import uuid4
 
-from .adapters import PaperAdapter
+from .adapters import PaperAdapter, BrokerRejectedError
 from .domain import Instrument, OrderPlan, Signal, TERMINAL, ValidationError, build_plan, timestamp, utc_now
 from .engine import Executor
 from .lease import session_lease
@@ -25,17 +25,14 @@ class UserSession:
         if self.account not in config.get("accounts", {}):
             raise ValidationError("会话账户必须列在accounts配置中")
         from .domain import decimal_value
-        self.fee_reserve = decimal_value(config.get("buy_fee_reserve", "5"), "buy_fee_reserve", positive=False)
-        if type(config.get("pretrade_account", True)) is not bool:
+        self.fee_reserve = decimal_value(config.get("buy_fee_reserve", "0"), "buy_fee_reserve", positive=False)
+        if type(config.get("pretrade_account", False)) is not bool:
             raise ValidationError("pretrade_account必须是true或false")
         self.mode = "ths-user" if live else "paper"
         self.store = Store(database or self.root / ("runtime/ths-draft.sqlite" if live else "runtime/console-paper.sqlite"))
         from .domain import validate_symbol
-        self.instruments = {validate_symbol(key): Instrument.parse(value) for key, value in config["instruments"].items()}
-        if not self.instruments:
-            raise ValidationError("至少配置一个证券及其交易规则")
-        self.symbol = config.get("default_symbol", next(iter(self.instruments)))
-        self.instrument = self.get_instrument(self.symbol)
+        self.instruments = {validate_symbol(key): Instrument.parse(value) for key, value in config.get("instruments", {}).items()}
+        self.symbol = config.get("default_symbol", next(iter(self.instruments), ""))
         self.last_account_snapshot = None
         self.lock_path = self.root / (config.get("session_lock", "runtime/ths-account.lock") if live else "runtime/console-paper.lock")
         self._recovered = False
@@ -48,7 +45,7 @@ class UserSession:
         else:
             seed = {"cash": "1000", "holdings": {}, **config.get("accounts", {}).get(self.account, {})}
             paper_config = {"accounts": {self.account: seed},
-                            "instruments": config["instruments"], "buy_fee_reserve": str(self.fee_reserve)}
+                            "instruments": config.get("instruments", {}), "buy_fee_reserve": str(self.fee_reserve)}
             self.adapter = PaperAdapter(self.store, paper_config["accounts"])
             self.engine = Executor(self.store, self.adapter, paper_config)
         self.quote_source = config.get("quote_source", "ths_client")
@@ -56,9 +53,14 @@ class UserSession:
         self.quote_provider = quote_provider
 
     def get_instrument(self, symbol):
-        if symbol not in self.instruments:
-            raise ValidationError("证券未配置；请先配置名称、交易单位及价格最小单位")
-        return self.instruments[symbol]
+        from .domain import validate_symbol
+        validate_symbol(symbol)
+        # Explicit model quantities/prices are passed through. The native client
+        # resolves the security name and the broker validates trading rules.
+        # Legacy paper fixtures may still provide rules for deterministic tests.
+        if not self.live and symbol in self.instruments:
+            return self.instruments[symbol]
+        return Instrument("", 1, Decimal("0.000000000001"))
 
     def execute(self, raw):
         """Model/HTTP entry: immutable explicit limit signal, same native path as UI."""
@@ -66,6 +68,8 @@ class UserSession:
         if signal.account != self.account:
             raise ValidationError("信号账户与当前会话不匹配")
         instrument = self.get_instrument(signal.symbol)
+        if not self.live:
+            self.engine.instruments[signal.symbol] = instrument
         plan = build_plan(signal, instrument, self.fee_reserve if signal.side == "buy" else Decimal("0"))
         with session_lease(self.lock_path):
             self._recover()
@@ -99,9 +103,11 @@ class UserSession:
         if self.quote_provider is not None:
             quote = self.quote_provider()
         elif not self.live:
-            sample = self.config.get("paper_quotes", {}).get(symbol, {})
-            bid = Decimal(sample.get("bid", str(instrument.price_tick * 1400)))
-            ask = Decimal(sample.get("ask", str(bid + instrument.price_tick)))
+            sample = self.config.get("paper_quotes", {}).get(symbol)
+            if not sample:
+                from .quotes import QuoteUnavailable
+                raise QuoteUnavailable("模拟执行不提供实时盘口；请填写模型传入的明确限价")
+            bid, ask = Decimal(sample["bid"]), Decimal(sample["ask"])
             quote = Quote(symbol, bid, ask, utc_now(), source="paper")
         elif self.quote_source == "ths_client":
             quote = self.adapter.read_quote(symbol, instrument)
@@ -157,7 +163,7 @@ class UserSession:
             holdings = json.loads(row["holdings"])
             snapshot = {"account": self.account, "observed_at": utc_now().isoformat(), "source": "paper",
                 "balances": {"available_cash": row["cash"], "cash_balance": row["cash"], "frozen_cash": "0"},
-                "positions": [{"symbol": symbol, "name": self.config["instruments"].get(symbol, {}).get("name", symbol),
+                "positions": [{"symbol": symbol, "name": self.config.get("instruments", {}).get(symbol, {}).get("name", symbol),
                     "position_quantity": quantity, "available_quantity": quantity} for symbol, quantity in holdings.items()],
                 "positions_complete": True, "positions_scope": "paper_ledger"}
         path = self.root / ("runtime/console-account-live.json" if self.live else "runtime/console-account-paper.json")
@@ -235,7 +241,7 @@ class UserSession:
         # the actual current window, account and order fields before submission.
         # Fresh account data is observable, not a local trading strategy or an
         # incomplete-OCR resource gate. The broker still validates resources.
-        if self.live and self.config.get("pretrade_account", True):
+        if self.live and self.config.get("pretrade_account", False):
             self._account_snapshot()
         quote = None if manual_price is not None else self._quote(symbol)
         price = str(manual_price) if quote is None else quote.price(side)
@@ -243,6 +249,7 @@ class UserSession:
                                "side": side, "quantity": quantity, "limit_price": price,
                                "expires_at": (utc_now() + timedelta(seconds=30)).isoformat()})
         if not self.live:
+            self.engine.instruments[symbol] = instrument
             result = self.engine.execute(signal.payload())
             self._log_order(result)
             return result
@@ -281,6 +288,8 @@ class UserSession:
         self.store.transition(signal_id, "SUBMITTING", expected=("PREPARED",), detail={"reason": "即将调用一次原生提交；失败不补发"})
         try:
             self.adapter.submit_prepared(plan, instrument, lambda receipt: self.store.record_receipt(signal_id, receipt))
+        except BrokerRejectedError as error:
+            self._record_submit_rejection(signal_id, error)
         except Exception as error:
             order = self.store.get(signal_id)
             if order["status"] not in TERMINAL:
@@ -288,6 +297,17 @@ class UserSession:
         result = self.store.get(signal_id)
         self._log_order(result)
         return result
+
+    def _record_submit_rejection(self, signal_id, error):
+        order = self.store.get(signal_id)
+        if order["status"] in TERMINAL:
+            return order
+        # A failure cannot overwrite an earlier accepted/fill receipt.
+        rejected = (not order["broker_order_id"] and not order["filled_quantity"]
+                    and not (order["detail"] or {}).get("broker_order_id_hint"))
+        return self.store.transition(signal_id, "REJECTED" if rejected else "UNKNOWN", expected=(order["status"],),
+            detail={**(order["detail"] or {}), "reason": str(error), "broker_error_code": error.code, "source": error.source,
+                    "resubmit_allowed": False})
 
     def _log_order(self, order):
         detail = order.get("detail") or {}
@@ -367,7 +387,7 @@ class UserSession:
             order = self.store.get(signal_id)
             if (not self.live or order["mode"] != "ths-user" or order["status"] != "UNKNOWN"
                     or order["broker_order_id"] or not order["plan"]
-                    or order["signal"]["account"] != self.account or order["signal"]["symbol"] not in self.instruments
+                    or order["signal"]["account"] != self.account
                     or order["plan"]["quantity"] <= 0):
                 raise ValidationError("只可继续本测试台尚未取得委托号的UNKNOWN原确认；不会创建新单")
             plan = OrderPlan(**order["plan"])
@@ -381,6 +401,8 @@ class UserSession:
                         "resubmit_allowed": False})
                 self.adapter.resume_confirmation(plan, lambda receipt: self.store.record_receipt(signal_id, receipt),
                                                  created_at=order["created_at"], persist_hint=hint)
+            except BrokerRejectedError as error:
+                self._record_submit_rejection(signal_id, error)
             except Exception as error:
                 current = self.store.get(signal_id)
                 if current["status"] not in TERMINAL:
@@ -411,7 +433,7 @@ class UserSession:
         with session_lease(self.lock_path):
             self._recover()
             order = self.store.get(signal_id)
-            if order["signal"]["account"] != self.account or order["signal"]["symbol"] not in self.instruments:
+            if order["signal"]["account"] != self.account:
                 raise ValidationError("撤单目标账户或标的不属于本测试台")
             if order["status"] in TERMINAL:
                 raise ValidationError(f"订单已经是{order['status']}，无需发送撤单")
@@ -453,7 +475,7 @@ class UserSession:
             if (not self.live or order["mode"] != "ths-user" or order["status"] != "UNKNOWN"
                     or order["broker_order_id"] or order["filled_quantity"] or not order["plan"]
                     or (order["detail"] or {}).get("broker_order_id_hint")
-                    or order["signal"]["account"] != self.account or order["signal"]["symbol"] not in self.instruments):
+                    or order["signal"]["account"] != self.account):
                 raise ValidationError("仅可核对未取得委托号的本测试台UNKNOWN记录；已受理订单必须查询回执")
             observation = self.adapter.verify_unsubmitted_resolution(OrderPlan(**order["plan"]))
             if observation.get("account_verified") is not True or observation.get("unblocked") is not True:

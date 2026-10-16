@@ -13,6 +13,9 @@ class QuoteUnavailable(ValidationError):
     """A readable snapshot cannot currently supply an executable book price."""
 
 
+CALENDAR_NOTICES = {"已收盘", "休市时段", "尚未开盘", "午间休市"}
+
+
 def session_notice(moment):
     local = moment.astimezone(timezone(timedelta(hours=8)))
     minute = local.hour * 60 + local.minute
@@ -49,13 +52,21 @@ class Quote:
     asks: tuple[BookLevel, ...] = ()
     change_percent: Decimal | None = None
     time_kind: str = "quote_time"
+    captured_at: datetime | None = None
 
     def price(self, side: str, *, now=None, max_age=5) -> str:
         if side not in {"buy", "sell"}:
             raise ValidationError("未知方向")
-        if self.session:
-            raise QuoteUnavailable(f"{self.session}，不能取得可执行的实时盘口；可自行选择手填限价，是否受理由券商返回；未发出委托")
-        age = (now or utc_now()) - self.observed_at
+        if self.session and self.session not in CALENDAR_NOTICES:
+            raise QuoteUnavailable(f"{self.session}，盘口不可用；可明确填写限价，是否受理由券商返回")
+        moment = now or utc_now()
+        # After hours the book's exchange/client clock may stop. A freshly
+        # captured snapshot can still supply an explicit limit order; do not
+        # reuse a cached screenshot indefinitely or bypass intraday quote age.
+        reference = self.captured_at if self.session in CALENDAR_NOTICES and self.captured_at is not None else self.observed_at
+        age = moment - reference
+        if self.observed_at > moment + timedelta(seconds=1):
+            raise QuoteUnavailable("盘口时间异常；请刷新盘口或明确填写限价")
         if age < timedelta(seconds=-1) or age > timedelta(seconds=max_age):
             raise QuoteUnavailable("盘口报价已过期或时间异常；请刷新盘口或自行选择手填限价，未改用旧价格")
         if self.bid <= 0 or self.ask <= 0 or self.bid > self.ask:
@@ -87,7 +98,8 @@ class Quote:
         source = {"ths_client": "同花顺客户端", "tencent_web": "腾讯Web", "paper": "模拟", "injected": "测试"}.get(self.source, self.source)
         time_label = "客户端显示时间" if self.time_kind == "client_display_time" else "报价时间"
         change = f"涨幅{self.change_percent}% / " if self.change_percent is not None else ""
-        return (f"来源：{source}；{status}；{last}{change}{book}；{time_label}{self.observed_at.astimezone(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}"
+        after_hours = "；时段提示不阻止限价委托，是否受理/成交以券商回执为准" if self.session in CALENDAR_NOTICES and not reasons else ""
+        return (f"来源：{source}；{status}；{last}{change}{book}；{time_label}{self.observed_at.astimezone(timezone(timedelta(hours=8))).strftime('%H:%M:%S')}" + after_hours
                 + ("\n" + "；".join(reasons) if reasons else ""))
 
     def payload(self):
@@ -96,7 +108,7 @@ class Quote:
         return json.loads(json.dumps(asdict(self), default=str))
 
 
-def parse_tencent(text: str, symbol="159570.SZ") -> Quote:
+def parse_tencent(text: str, symbol="159570.SZ", *, captured_at=None) -> Quote:
     lines = [line for line in text.splitlines() if line.strip()]
     prefix = symbol[-2:].lower() + symbol[:6]
     if len(lines) != 1 or not lines[0].startswith(f'v_{prefix}="') or lines[0].count('"') != 2:
@@ -125,13 +137,15 @@ def parse_tencent(text: str, symbol="159570.SZ") -> Quote:
             result.append(BookLevel(index + 1, price, quantity))
         return tuple(result)
     return Quote(symbol, bid, ask, observed, last, bid_quantity, ask_quantity, session_notice(observed),
-                 source="tencent_web", bids=levels(9), asks=levels(19))
+                 source="tencent_web", bids=levels(9), asks=levels(19), captured_at=captured_at)
 
 
 def fetch_quote(symbol="159570.SZ") -> Quote:
     validate_symbol(symbol)
+    if "." not in symbol:
+        raise ValidationError("Web行情需提供市场后缀；六位代码请使用同花顺客户端行情")
     prefix = symbol[-2:].lower() + symbol[:6]
     request = Request("https://qt.gtimg.cn/q=" + prefix, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(request, timeout=5) as response:
         text = response.read(65536).decode("gbk", errors="strict")
-    return parse_tencent(text, symbol)
+    return parse_tencent(text, symbol, captured_at=utc_now())

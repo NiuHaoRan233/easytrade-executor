@@ -37,7 +37,8 @@ class ThsDraftAdapter:
         self.app = None
         self.main = None
         self._verified_caption_digest = None
-        self.reader = OcrTableReader(float(profile.get("ocr_min_confidence", 0.85)))
+        self.reader = OcrTableReader(float(profile.get("ocr_min_confidence", 0.85)),
+                                     unclip_ratio=profile.get("ocr_unclip_ratio"))
         self.timeout = float(profile.get("timeout_seconds", 8))
         self.ocr_scales = profile.get("ocr_scale_by_role", {"orders": 2, "trades": 2})
         if (not isinstance(self.ocr_scales, dict) or set(self.ocr_scales) - {"positions", "orders", "trades"}
@@ -192,9 +193,14 @@ class ThsDraftAdapter:
                                       visible_only=True, enabled_only=True).wrapper_object()
 
     def _has_visible_control(self, control_id: int, class_name: str):
-        # WindowSpecification.exists() explicitly ignores visible_only.
-        return any(control.is_visible() for control in
-                   self.main.descendants(control_id=control_id, class_name=class_name))
+        import win32gui
+        found = []
+        def inspect(handle, _):
+            if (win32gui.GetDlgCtrlID(handle) == control_id and win32gui.GetClassName(handle) == class_name
+                    and win32gui.IsWindowVisible(handle)):
+                found.append(handle)
+        win32gui.EnumChildWindows(self.main.handle, inspect, None)
+        return bool(found)
 
     def _read_edit(self, control_id: int):
         control = self._control(control_id, "Edit")
@@ -234,6 +240,20 @@ class ThsDraftAdapter:
             tree.get_item(path).select()
         self._wait(lambda: tree.get_item(path).is_selected(), "查询页没有选中")
 
+    def _select_market(self, symbol):
+        if self._has_visible_control(1003, "ComboBox"):
+            if "." not in symbol:
+                raise PreparationError("此旧版市场控件需要代码带.SH/.SZ/.BJ后缀")
+            self._control(1003, "ComboBox").select({"SH": "上海A股", "SZ": "深圳A股", "BJ": "北京A股"}[symbol[-2:]])
+        else:
+            # Observed newer THS form resolves the security from the code.
+            if self._control(3001, "Static").window_text() != "证券代码":
+                raise PreparationError("未识别的证券代码自动识别控件")
+
+    def _security_name(self, instrument):
+        name = self._control(1036, "Static").window_text().strip()
+        return name if name and (not instrument.name or instrument.name in name) else ""
+
     def read_table(self, role: str):
         self._page(self.profile["pages"][role])
         last_error = None
@@ -271,7 +291,16 @@ class ThsDraftAdapter:
                 "grid_box": [rect.left - outer.left, rect.top - outer.top,
                              rect.right - outer.left, rect.bottom - outer.top], "dpi": dpi}
 
+    @read_operation("quote")
     def read_quote(self, symbol, instrument):
+        for attempt in range(2):
+            try:
+                return self._read_quote_once(symbol, instrument)
+            except ForegroundChangedError:
+                if attempt:
+                    raise
+
+    def _read_quote_once(self, symbol, instrument):
         """Read the native quote panel; only fill the symbol, never a submit action."""
         from .native_quotes import parse_panel
         validate_symbol(symbol)
@@ -281,13 +310,14 @@ class ThsDraftAdapter:
             self._page(self.profile["pages"]["buy"])
         code = self._read_edit(1032)
         if code != symbol[:6]:
-            if any(self._read_edit(i) for i in (1033, 1034)):
+            if self._read_edit(1034):
                 raise PreparationError("当前有其他标的或未清空草稿，行情刷新未覆盖；请先核对客户端字段")
             self.clear_draft()
-            self._control(1003, "ComboBox").select({"SH": "上海A股", "SZ": "深圳A股", "BJ": "北京A股"}[symbol[-2:]])
+            self._select_market(symbol)
             self._set_text(1032, symbol[:6])
             self._focus_edit(1033)  # blur the symbol; no Enter or submission
-        self._wait(lambda: instrument.name in self._control(1036, "Static").window_text(), "客户端行情证券名称未匹配")
+        self._wait(lambda: self._security_name(instrument), "客户端未识别证券代码或名称未匹配")
+        security_name = self._security_name(instrument)
         last_error = None
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
@@ -298,23 +328,34 @@ class ThsDraftAdapter:
                 # then require OCR labels/geometry; never use screen coordinates.
                 # The chart exposes a UIA name, not a Win32 class name.
                 from pywinauto import Desktop
-                chart = Desktop(backend="uia").window(handle=self.main.handle).child_window(
-                    title="EmbChart", control_type="Pane", visible_only=True).wrapper_object()
-                outer, rect = self.main.rectangle(), chart.rectangle()
-                panel_width = int(self.profile.get("quote_panel_width", 250))
+                import win32gui
+                chart_handle = getattr(self, "_quote_chart_handle", None)
+                if (not chart_handle or not win32gui.IsWindow(chart_handle) or not win32gui.IsWindowVisible(chart_handle)
+                        or not win32gui.IsChild(self.main.handle, chart_handle)):
+                    chart = Desktop(backend="uia").window(handle=self.main.handle).child_window(
+                        title="EmbChart", control_type="Pane", visible_only=True).wrapper_object()
+                    chart_handle = self._quote_chart_handle = chart.handle
+                from pywinauto.win32structures import RECT
+                outer, rect = self.main.rectangle(), RECT(*win32gui.GetWindowRect(chart_handle))
+                dpi = self._window_dpi()
+                panel_width = int(self.profile.get("quote_panel_width", round(260 * dpi / 96)))
                 box = (rect.left - outer.left - panel_width, rect.top - outer.top,
                        rect.left - outer.left - 4, rect.bottom - outer.top)
                 if not (0 <= box[0] < box[2] <= outer.width() and 0 <= box[1] < box[3] <= outer.height()):
                     raise PreparationError("客户端报价控件超出窗口范围")
-                image = self.main.capture_as_image().crop(box)
+                from .screen_capture import capture_region
+                captured_at = utc_now()
+                image = measure(self, "quote_capture", lambda: capture_region(
+                    (outer.left + box[0], outer.top + box[1], outer.left + box[2], outer.top + box[3])))
                 if self.profile.get("console_diagnostics"):
                     destination = Path(self.profile["console_diagnostics"]).parent / "diagnostics" / "native-quote-last.png"
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     image.save(destination)
-                picture = image.resize((image.width * 3, image.height * 3))
-                result = self.reader._recognize(picture)
-                quote = parse_panel(result, picture.width, picture.height, symbol, utc_now(), confidence=self.reader.confidence)
-                if self._read_edit(1032) != symbol[:6] or instrument.name not in self._control(1036, "Static").window_text():
+                scale = int(self.profile.get("quote_ocr_scale", 2))
+                picture = image.resize((image.width * scale, image.height * scale)) if scale != 1 else image
+                result = measure(self, "quote_ocr", lambda: self.reader._recognize(picture))
+                quote = parse_panel(result, picture.width, picture.height, symbol, captured_at, confidence=self.reader.confidence)
+                if self._read_edit(1032) != symbol[:6] or self._security_name(instrument) != security_name:
                     raise PreparationError("读取报价期间证券代码或名称变化")
                 self._assert_identity()
                 return quote
@@ -324,6 +365,13 @@ class ThsDraftAdapter:
                 last_error = error
                 time.sleep(.1)
         raise PreparationError(f"客户端报价区未就绪：{last_error}；未切换到Web行情")
+
+    def _window_dpi(self):
+        import ctypes
+        try:
+            return ctypes.windll.user32.GetDpiForWindow(self.main.handle) or 96
+        except (AttributeError, OSError):
+            return 96
 
     def _set_text(self, control_id: int, value: str):
         self._assert_identity()
@@ -348,15 +396,12 @@ class ThsDraftAdapter:
         self._focus_edit(control_id)
         control.type_keys("{HOME}+{END}{BACKSPACE}", set_foreground=False, vk_packet=False)
         self._wait(lambda: self._read_edit(control_id) == "", "无法完整清空输入框")
-        prefix = ""
-        for char in value:
-            self._assert_identity()
-            if not control.has_keyboard_focus():
-                raise PreparationError("输入期间键盘焦点改变")
-            key = "{VK_DECIMAL}" if char == "." else "{VK_NUMPAD" + char + "}"
-            control.type_keys(key, pause=0.03, set_foreground=False, vk_packet=False)
-            prefix += char
-            self._wait(lambda: self._read_edit(control_id) == prefix, "字符输入未被客户端接受")
+        self._assert_identity()
+        if not control.has_keyboard_focus():
+            raise PreparationError("输入期间键盘焦点改变")
+        keys = "".join("{VK_DECIMAL}" if char == "." else "{VK_NUMPAD" + char + "}" for char in value)
+        control.type_keys(keys, pause=0, set_foreground=False, vk_packet=False)
+        self._assert_identity()
         self._wait(matches, "键盘输入后回读仍不匹配")
 
     @read_operation("account")
@@ -397,14 +442,21 @@ class ThsDraftAdapter:
         """Inspect only the grid's actual ancestor chain, never sibling tables."""
         import win32gui
         grid = self._control(self.profile.get("grid_control_id", 1047), self.profile.get("grid_class", "CVirtualGridCtrl"))
-        candidates, control = [], grid
+        candidates, seen, control = [], set(), grid
         for _ in range(12):
             if control.handle == self.main.handle:
                 break
             if win32gui.GetWindowLong(control.handle, -16) & 0x00200000:  # WS_VSCROLL
                 candidates.append(control)
+                seen.add(control.handle)
             # THS wraps some grids in HexinScrollWnd plus a standard ScrollBar.
             for child in control.children(class_name="ScrollBar"):
+                # pywinauto's filtered children() also returns descendants.
+                # An outer MDI frame contains the navigation tree as well as
+                # the grid: only a bar owned directly by a grid ancestor is
+                # evidence of the table's scroll range.
+                if child.parent().handle != control.handle or child.handle in seen:
+                    continue
                 rect = child.rectangle()
                 if child.is_visible() and rect.height() > rect.width():
                     scrollbar = TableScrollBar(child)
@@ -413,6 +465,7 @@ class ThsDraftAdapter:
                         if page <= 0:
                             raise ValidationError("表格独立滚动条未提供有效页大小，目前只能确认可见行")
                         candidates.append(scrollbar)
+                        seen.add(child.handle)
             control = control.parent()
             if control is None:
                 raise ValidationError("表格滚动容器未核对到交易主窗口")
@@ -499,10 +552,20 @@ class ThsDraftAdapter:
             return False
         if not self._has_visible_control(1032, "Edit"):
             raise PreparationError("交易页未找到可见代码框，无法确认清空")
-        reset = self.main.child_window(control_id=1007, class_name="Button", title="重填", visible_only=True)
+        if all(self._read_edit(i) == "" for i in (1032, 1033, 1034)):
+            return True  # Some client versions omit the reset button entirely.
         # Query filters reuse all three edit IDs and button 1007. Only the
         # selected trade page and exact reset button are valid cleanup targets.
-        reset.click()
+        if self._has_visible_control(1007, "Button"):
+            reset = self._control(1007, "Button")
+            if reset.window_text() != "重填":
+                raise PreparationError("重填控件文字未匹配")
+            reset.click()
+        else:
+            for control_id in (1034, 1033, 1032):
+                self._focus_edit(control_id)
+                self._control(control_id, "Edit").type_keys("{HOME}+{END}{BACKSPACE}", set_foreground=False, vk_packet=False)
+            self._focus_edit(1033)
         self._wait(lambda: all(self._read_edit(i) == "" for i in (1032, 1033, 1034)),
                    "草稿未清空；请人工清空表单，不能继续准备下一单")
         return True
@@ -531,13 +594,12 @@ class ThsDraftAdapter:
             self._page(side_path)
             self._wait(lambda: self._has_visible_control(1032, "Edit"), "交易输入框未就绪")
             self.clear_draft()
-            market = {"SH": "上海A股", "SZ": "深圳A股", "BJ": "北京A股"}[plan.symbol[-2:]]
-            self._control(1003, "ComboBox").select(market)
+            self._select_market(plan.symbol)
             self._assert_identity()
             self._set_text(1032, plan.symbol[:6])
             # Moving focus emits the code edit change/blur notification; no Enter.
             self._focus_edit(1033)
-            self._wait(lambda: instrument.name in self._control(1036, "Static").window_text(), "证券名称未匹配，可能报价未刷新")
+            self._wait(lambda: self._security_name(instrument), "客户端未识别证券代码或名称未匹配")
             self._set_text(1033, plan.limit_price)
             self._set_text(1034, str(plan.quantity))
             observed = {"code": self._read_edit(1032),
@@ -546,6 +608,7 @@ class ThsDraftAdapter:
                         "name": self._control(1036, "Static").window_text().strip()}
             if observed["code"] != plan.symbol[:6] or Decimal(observed["price"]) != Decimal(plan.limit_price) or observed["quantity"] != str(plan.quantity):
                 raise PreparationError("交易字段回读与计划不一致")
+            self._prepared_security = {"code": observed["code"], "name": observed["name"], "side": plan.side}
             self._assert_identity()
             # No reference to the buy/sell submit button (1006) is used here.
             return {"verified": observed, "submitted": False, "manual_submit_required": True}

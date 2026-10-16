@@ -1,24 +1,12 @@
 {
-  "default_symbol": "000001.SZ",
   "quote_source": "ths_client",
-  "pretrade_account": true,
+  "pretrade_account": false,
   "session_lock": "runtime/ths-account.lock",
-  "buy_fee_reserve": "5",
+  "buy_fee_reserve": "0",
   "accounts": {
     "broker": {}
   },
-  "instruments": {
-    "000001.SZ": {
-      "name": "平安银行",
-      "lot_size": 100,
-      "price_tick": "0.01"
-    },
-    "510300.SH": {
-      "name": "沪深300",
-      "lot_size": 100,
-      "price_tick": "0.001"
-    }
-  },
+  "instruments": {},
   "ths_profile": {
     "account_alias": "broker",
     "exe_path": "C:\\Path\\To\\THS\\xiadan.exe",

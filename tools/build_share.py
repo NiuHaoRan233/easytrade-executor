@@ -10,9 +10,12 @@ import zipfile
 FIXED = (
     ".gitignore", ".gitattributes", ".github/workflows/test.yml", "README.md", "CHANGELOG.md", "pyproject.toml",
     "Setup.cmd", "Start-Test-Console.cmd", "Start-Paper-Service.cmd", "Start-Live-Service.cmd",
+    "Check-Environment.cmd", "Configure-Client.cmd",
+    "constraints/windows-py313-tested.txt",
     "config/paper.example.json", "config/ths.example.json",
     "docs/quickstart.md", "docs/local-test-console.md", "docs/model-integration.md", "docs/architecture.md",
     "docs/client-adaptation.md",
+    "docs/first-machine.md", "tools/check_environment.py",
     "examples/model_client.py", "tools/console_smoke.py", "tools/build_share.py",
 )
 

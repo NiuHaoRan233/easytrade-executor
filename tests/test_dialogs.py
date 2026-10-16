@@ -1,9 +1,17 @@
 import unittest
 
-from easytrade.dialogs import classify_dialog
+from easytrade.dialogs import classify_dialog, explicit_submit_rejection
 
 
 class DialogTests(unittest.TestCase):
+    def test_only_explicit_observed_night_channel_submit_error_is_terminal(self):
+        message = "提交失败：ABPCall[900005]=-410411020, errmsg:-410411020[-150906115]低延时98客户不支持夜市"
+        self.assertEqual(explicit_submit_rejection(message)["code"], "-150906115")
+        for text in (message.replace("提交失败", "查询失败"), message.replace("-150906115", "-1509061159"),
+                     message + " 委托已成功提交", "连接超时，提交结果未知", "提交失败：其他错误"):
+            with self.subTest(text=text):
+                self.assertIsNone(explicit_submit_rejection(text))
+
     def test_confirmation_is_never_acceptance(self):
         for title in ("委托确认", "买入确认", "卖出确认"):
             result = classify_dialog(title, "是否买入159570，100份，委托编号:000123")

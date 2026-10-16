@@ -10,7 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .user_session import UserSession
-from .domain import TERMINAL
+from .domain import TERMINAL, validate_symbol
 from .diagnostics import CONSOLE_BUILD, record_action
 from .quotes import QuoteUnavailable
 from .configuration import load_config
@@ -26,26 +26,27 @@ ACTION_LABELS = {"list": "读取本地记录", "quote": "刷新盘口", "buy": "
 
 
 class Console:
-    def __init__(self, root, project_root=ROOT):
+    def __init__(self, root, project_root=ROOT, *, live=False):
         import tkinter as tk
         from tkinter import ttk
         self.root, self.project_root = root, Path(project_root)
         self.messages, self.tasks = queue.Queue(), queue.Queue()
         self.busy, self.closing, self.stop = False, False, threading.Event()
         record_action(self.project_root, "console_started")
-        self.mode = tk.StringVar(value="模拟（不连接客户端）")
-        self.price_mode = tk.StringVar(value="盘口限价")
+        self.mode = tk.StringVar(value="实盘（测试中）" if live else "模拟（不连接客户端）")
+        self.price_mode = tk.StringVar(value="手填限价")
         self.manual_price, self.broker_id = tk.StringVar(value=""), tk.StringVar(value="")
-        self.quantity = tk.StringVar(value="100")
-        initial_config = load_config(self.project_root)
-        self.catalog = initial_config["instruments"]
-        self.symbol = tk.StringVar(value=initial_config.get("default_symbol", next(iter(self.catalog))))
+        self.quantity = tk.StringVar(value="")
+        initial_config = load_config(self.project_root, live=live)
+        self.catalog = {}
+        self.holding_choices = {}
+        self.symbol = tk.StringVar(value="")
         self.instrument_text = tk.StringVar()
         self.quote_source = tk.StringVar(value="同花顺客户端（默认）")
         self.banner = tk.StringVar()
         self.pending_hint = tk.StringVar(value="")
         self.result_text = tk.StringVar(value="就绪 · 操作结果会显示在这里，详细过程见下方运行日志。")
-        self.quote_text = tk.StringVar(value="模拟盘口：买一1.400 / 卖一1.401（固定样本，非实时）")
+        self.quote_text = tk.StringVar(value="输入代码后可刷新客户端盘口；明确限价可直接执行。")
         self.account_text = tk.StringVar(value="账户与持仓尚未读取")
         self.broker_text = tk.StringVar(value="券商当日委托尚未读取")
         self.check_text = tk.StringVar(value="首次使用：先固定客户端窗口及列宽，切换实盘后点击“客户端适配检查”。\n只读检查，不发送买卖或撤单；完成后仍需人工逐项对照。")
@@ -56,7 +57,7 @@ class Console:
         root.minsize(min(1000, width), min(740, height))
         frame = ttk.Frame(root, padding=10)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Easytrade · 买入 / 卖出 / 资金持仓 / 委托查询", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Easytrade · 模型指令买卖 / 资金持仓 / 委托查询", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
         ttk.Label(frame, text=f"调试版本 {CONSOLE_BUILD}", foreground="#666666").pack(anchor="w")
         self.banner_label = tk.Label(frame, textvariable=self.banner, anchor="w", justify="left", padx=10, pady=7,
                                      font=("Microsoft YaHei UI", 11))
@@ -64,11 +65,13 @@ class Console:
         instrument_row = ttk.Frame(frame)
         instrument_row.pack(fill="x", pady=(0, 6))
         ttk.Label(instrument_row, text="证券：").pack(side="left")
-        self.symbol_box = ttk.Combobox(instrument_row, textvariable=self.symbol, state="readonly", width=19,
+        self.symbol_box = ttk.Combobox(instrument_row, textvariable=self.symbol, state="normal", width=19,
                                         values=tuple(self.catalog))
         self.symbol_box.pack(side="left")
         self.symbol_box.bind("<<ComboboxSelected>>", self.change_symbol)
-        ttk.Label(instrument_row, textvariable=self.instrument_text).pack(side="left", padx=8)
+        self.symbol_box.bind("<Return>", self.change_symbol)
+        self.symbol_box.bind("<FocusOut>", self.change_symbol)
+        ttk.Label(instrument_row, text="输入模型传入的六位代码，可附.SH/.SZ/.BJ；无需预先配置证券。").pack(side="left", padx=8)
         settings = ttk.Frame(frame)
         settings.pack(fill="x")
         self.mode_box = ttk.Combobox(settings, textvariable=self.mode, state="readonly", width=29,
@@ -182,6 +185,7 @@ class Console:
         self.positions_table.configure(yscrollcommand=position_scroll.set)
         position_scroll.pack(side="right", fill="y")
         self.positions_table.pack(side="left", fill="both", expand=True)
+        self.positions_table.bind("<Double-1>", self.select_position)
         columns = ("symbol", "side", "quantity", "price", "status", "broker", "filled")
         self.table = ttk.Treeview(orders_tab, columns=columns, show="headings", height=8, selectmode="browse")
         for name, title, width in zip(columns, ("代码", "方向", "份数", "限价", "状态", "完整委托编号", "累计成交"), (100, 55, 55, 85, 230, 250, 85)):
@@ -226,9 +230,10 @@ class Console:
     def change_mode(self, event=None):
         try:
             config = load_config(self.project_root, live=self.mode.get().startswith("实盘"))
-            self.catalog = config["instruments"]
+            self.catalog = {}
+            self.holding_choices = {}
             self.symbol_box.configure(values=tuple(self.catalog))
-            self.symbol.set(config.get("default_symbol", next(iter(self.catalog))))
+            self.symbol.set("")
             self.change_symbol()
         except Exception as error:
             self.append_log(str(error))
@@ -246,18 +251,35 @@ class Console:
             self.positions_table.delete(item)
         self.pending_hint.set("")
         self.broker_id.set("")
-        self.quote_text.set(f"{self.symbol.get()} 盘口尚未刷新；模拟报价为固定样本")
+        self.quote_text.set("输入代码后可刷新客户端盘口" if self.mode.get().startswith("实盘") else "模拟执行请填写模型传入的明确限价")
         self.start("list")
 
     def change_symbol(self, event=None):
-        item = self.catalog.get(self.symbol.get())
-        if item:
-            self.instrument_text.set(f"{item['name']}  |  数量单位 {item['lot_size']}  |  价格最小单位 {item['price_tick']}")
-            self.quantity.set(str(item["lot_size"]))
-        self.quote_text.set(f"{self.symbol.get()} 行情尚未刷新；模拟使用固定样本")
+        if self.busy:
+            return
+        self.symbol.set(self.symbol.get().strip().upper())
+        self.quote_text.set((f"{self.symbol.get()} 行情尚未刷新" if self.symbol.get() else "输入代码后可刷新客户端盘口")
+                            if self.mode.get().startswith("实盘") else "模拟执行请填写模型传入的明确限价")
         if hasattr(self, "book_table"):
             for item_id in self.book_table.get_children():
                 self.book_table.delete(item_id)
+
+    def update_symbol_choices(self, positions):
+        self.holding_choices = {}
+        for row in positions:
+            symbol = row["symbol"]
+            self.holding_choices[symbol] = row
+        self.symbol_box.configure(values=tuple(self.holding_choices))
+
+    def select_position(self, event=None):
+        if self.busy:
+            return
+        selected = self.positions_table.selection()
+        if not selected:
+            return
+        code = str(self.positions_table.item(selected[0], "values")[0])
+        self.symbol.set(code)
+        self.change_symbol()
 
     def change_quote_source(self, event=None):
         self.quote_text.set(f"已选择{self.quote_source.get()}；请刷新行情，发单时也使用该来源")
@@ -266,7 +288,7 @@ class Console:
 
     def select_order(self, event=None):
         selected = self.table.selection()
-        if selected:
+        if selected and selected[0] in self.rows:
             order = self.rows[selected[0]]
             self.broker_id.set(order["broker_order_id"] or (order["detail"] or {}).get("broker_order_id_hint") or "")
         self.update_recovery_buttons()
@@ -292,6 +314,7 @@ class Console:
             button.configure(state="disabled" if busy else "normal")
         for box in (self.mode_box, self.price_box, self.source_box, self.symbol_box):
             box.configure(state="disabled" if busy else "readonly")
+        self.symbol_box.configure(state="disabled" if busy else "normal")
         self.price_entry.configure(state="disabled" if busy else "normal")
         self.quantity_entry.configure(state="disabled" if busy else "normal")
         self.broker_entry.configure(state="disabled" if busy else "normal")
@@ -361,13 +384,19 @@ class Console:
             elif not messagebox.askyesno("核对旧草稿", f"只有你确认从未在客户端提交过这笔草稿，才可清空。\n\n{signal_id}\n\n确认它从未提交？", default="no", parent=self.root):
                 return
         manual = self.manual_price.get().strip() if self.price_mode.get() == "手填限价" else None
+        if action in {"quote", "buy", "sell"}:
+            self.symbol.set(self.symbol.get().strip().upper())
+            try:
+                validate_symbol(self.symbol.get())
+            except ValueError as error:
+                self.show_result("未开始 · " + str(error), "error")
+                return
         quantity = 100
         if action in {"buy", "sell"}:
             raw_quantity = self.quantity.get().strip()
-            lot = self.catalog[self.symbol.get()]["lot_size"]
-            if not raw_quantity.isascii() or not raw_quantity.isdigit() or int(raw_quantity) <= 0 or int(raw_quantity) % lot:
-                self.show_result(f"未开始 · 数量请填写{lot}的正整数倍。", "error")
-                self.append_log(f"数量请填写{lot}的正整数倍。")
+            if not raw_quantity.isascii() or not raw_quantity.isdigit() or int(raw_quantity) <= 0:
+                self.show_result("未开始 · 数量请填写正整数，交易单位由券商核验。", "error")
+                self.append_log("数量请填写正整数。")
                 return
             quantity = int(raw_quantity)
         if action in {"buy", "sell"} and manual == "":
@@ -407,8 +436,8 @@ class Console:
                 try:
                     live, action = task["live"], task["action"]
                     record_action(self.project_root, "action_started", **task)
-                    if live not in sessions:
-                        config = load_config(self.project_root, live=live)
+                    config = load_config(self.project_root, live=live)
+                    if live not in sessions or sessions[live].config != config:
                         sessions[live] = UserSession(self.project_root, config, live=live,
                             log=lambda message, live=live: self.messages.put(("log", ("[实盘] " if live else "[模拟] ") + message)))
                     session = sessions[live]
@@ -421,7 +450,7 @@ class Console:
                             ask_quantity=quote.ask_quantity, last=str(quote.last) if quote.last is not None else None,
                             session=quote.session, source=quote.source, snapshot=quote.payload(),
                             elapsed_ms=round((time.monotonic() - quote_started) * 1000, 1), observed_at=quote.observed_at.isoformat())
-                        self.messages.put(("quote", quote.describe() if live else f"模拟固定样本盘口：买一{quote.bid} / 卖一{quote.ask}；{quote.observed_at.astimezone().strftime('%H:%M:%S')}"))
+                        self.messages.put(("quote", quote.describe()))
                         self.messages.put(("quote_snapshot", quote.payload()))
                     elif action in {"buy", "sell"}:
                         result = session.submit_and_follow(action, symbol=task["symbol"], quantity=task["quantity"], manual_price=task["manual"], signal_id=task["request_id"], stop=self.stop)
@@ -537,6 +566,7 @@ class Console:
                     self.broker_text.set("本次委托读取失败：" + value + "\n下方若有数据为上次快照。\n" + self.broker_text.get())
                     self.tabs.select(self.broker_tab)
                 elif kind == "account":
+                    self.update_symbol_choices(value["positions"])
                     balances = value["balances"]
                     scope = ("完整持仓" if value['source'] != 'paper' else "完整模拟账本") if value["positions_complete"] else "客户端可见持仓，尚不保证包含分页/滚动区外记录"
                     self.account_text.set(f"账户 {value['account']} | 资金余额 {balances.get('cash_balance', '—')} | 可用资金 {balances['available_cash']} | 冻结 {balances.get('frozen_cash', '—')} | "
@@ -597,9 +627,10 @@ def main():
     import tkinter as tk
     parser = argparse.ArgumentParser(description="Easytrade通用交易测试台")
     parser.add_argument("--root", default=str(ROOT), help="配置/运行数据目录")
+    parser.add_argument("--mode", choices=("paper", "ths-live"), default="paper")
     args = parser.parse_args()
     root = tk.Tk()
-    Console(root, args.root)
+    Console(root, args.root, live=args.mode == "ths-live")
     root.mainloop()
 
 

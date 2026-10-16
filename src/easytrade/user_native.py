@@ -15,6 +15,8 @@ from uuid import uuid4
 from .domain import OrderPlan, ValidationError, utc_now
 from .ths import ThsDraftAdapter
 from .read_metrics import read_operation
+from .adapters import BrokerRejectedError
+from .dialogs import explicit_submit_rejection
 
 
 def positive_button_id(buttons, *, kind=None):
@@ -209,17 +211,24 @@ class ThsUserAdapter(ThsDraftAdapter):
                            "source": item.get("source", "win32")}
                 # Persist the ID in the caller before dismissing the success dialog.
                 return receipt, item
+            if kind == "REJECTION" and confirmed:
+                rejection = explicit_submit_rejection(item.get("text", ""))
+                if rejection:
+                    raise BrokerRejectedError(item["text"], code=rejection["code"], source=item.get("source", "win32"))
             raise ValidationError(f"弹窗需要核对：{kind}；{item.get('text', '')[:250]}")
         raise ValidationError("提交后未取得含完整委托编号的回执；禁止重发")
 
     def submit_prepared(self, plan: OrderPlan, instrument, persist_receipt):
         self._assert_identity()
+        if not instrument.name and getattr(self, "_prepared_security", None) != {
+                "code": plan.symbol[:6], "name": self._security_name(instrument), "side": plan.side}:
+            raise ValidationError("提交前客户端证券身份与本次准备记录不匹配")
         tree = self._control(self.profile.get("tree_control_id", 129), "SysTreeView32")
         if not tree.get_item(self.profile["pages"][plan.side]).is_selected():
             raise ValidationError("提交前交易页发生变化")
         if (self._read_edit(1032) != plan.symbol[:6] or self._read_edit(1034) != str(plan.quantity)
                 or Decimal(self._read_edit(1033)) != Decimal(plan.limit_price)
-                or instrument.name not in self._control(1036, "Static").window_text()):
+                or not self._security_name(instrument)):
             raise ValidationError("提交前字段回读改变")
         button = self._control(1006, "Button")
         expected = "买入" if plan.side == "buy" else "卖出"

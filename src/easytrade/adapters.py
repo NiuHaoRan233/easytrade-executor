@@ -17,6 +17,14 @@ class ForegroundChangedError(PreparationError):
     """The verified client lost foreground ownership during an operation."""
 
 
+class BrokerRejectedError(PreparationError):
+    """A specifically recognized rejection bound to the current submission."""
+
+    def __init__(self, message, *, code, source="win32"):
+        super().__init__(message)
+        self.code, self.source = code, source
+
+
 class DraftCleanupError(PreparationError):
     """Draft state cannot be verified after preparation fails."""
 

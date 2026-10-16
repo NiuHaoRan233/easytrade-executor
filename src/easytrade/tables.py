@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
@@ -132,15 +133,22 @@ class TableSnapshot:
 class OcrTableReader:
     """Uses table grid lines, not fixed desktop coordinates. No mouse/keyboard actions."""
 
-    def __init__(self, confidence: float = 0.85):
+    def __init__(self, confidence: float = 0.85, *, unclip_ratio: float | None = None):
+        if unclip_ratio is not None and (type(unclip_ratio) not in (int, float)
+                or not math.isfinite(unclip_ratio) or not 1 <= unclip_ratio <= 2):
+            raise ValidationError("ocr_unclip_ratio必须为1至2之间的有限数值")
         self.confidence = confidence
+        self.unclip_ratio = unclip_ratio
         self._engine = None
 
     def _recognize(self, image):
         import numpy as np
         from rapidocr import RapidOCR
         if self._engine is None:
-            self._engine = RapidOCR()
+            # Tune detection-box expansion for the client's font/DPI. The
+            # full-box cell boundaries and confidence checks below still apply.
+            self._engine = (RapidOCR() if self.unclip_ratio is None else
+                            RapidOCR(params={"Det.unclip_ratio": self.unclip_ratio}))
         return self._engine(np.asarray(image.convert("RGB")))
 
     def read_text(self, image) -> str:

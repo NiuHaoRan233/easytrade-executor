@@ -68,7 +68,8 @@ def create_server(executor: Executor, token: str, port: int = 8765) -> HTTPServe
                 elif method == "POST" and parts == ["signals"]:
                     self.send_json(200, executor.execute(self.body()))
                 elif session and method == "GET" and parts == ["instruments"]:
-                    self.send_json(200, {"instruments": session.config["instruments"], "default_symbol": session.symbol})
+                    self.send_json(200, {"instruments": session.config.get("instruments", {}), "default_symbol": session.symbol,
+                                         "symbol_input": "six_digit_code_or_exchange_suffix", "preconfiguration_required": False})
                 elif session and method == "GET" and parts == ["account"]:
                     self.send_json(200, session.account_snapshot())
                 elif session and method == "GET" and parts == ["broker-orders"]:

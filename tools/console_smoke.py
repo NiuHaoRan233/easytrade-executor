@@ -1,28 +1,21 @@
-"""Exercise the actual Tk worker and buttons in simulation, in a temporary folder."""
-from __future__ import annotations
-
+"""Exercise model-style explicit instructions through the real Tk worker, offline."""
 import json
 import tempfile
 import time
 import tkinter as tk
-from decimal import Decimal
-from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from easytrade.console import Console, ROOT
-from easytrade.quotes import Quote
-from easytrade.domain import utc_now
+from easytrade.console import Console
 
 
 def main():
     with tempfile.TemporaryDirectory(prefix="easytrade-console-smoke-") as directory:
         project = Path(directory)
         (project / "config").mkdir()
-        (project / "config/ths.example.json").write_text(
-            (ROOT / "config/ths.example.json").read_text(encoding="utf-8"), encoding="utf-8")
-        (project / "config/paper.example.json").write_text(
-            (ROOT / "config/paper.example.json").read_text(encoding="utf-8"), encoding="utf-8")
+        config = {"account": "demo", "accounts": {"demo": {"cash": "100000", "holdings": {}}},
+                  "instruments": {}, "buy_fee_reserve": "0"}
+        (project / "config/paper.example.json").write_text(json.dumps(config), encoding="utf-8")
         root = tk.Tk()
         root.withdraw()
         with patch("easytrade.user_native.ThsUserAdapter", side_effect=AssertionError("native adapter forbidden in smoke")):
@@ -31,125 +24,62 @@ def main():
                 deadline = time.monotonic() + 10
                 while console.busy and time.monotonic() < deadline:
                     root.update()
-                    time.sleep(0.02)
-                if console.busy:
-                    raise AssertionError("GUI worker timed out")
+                    time.sleep(.02)
+                assert not console.busy, "GUI worker timed out"
+                root.update()
             try:
                 wait_done()
-                assert not console.rows, "startup must not trade"
-                assert console.mode.get().startswith("模拟")
-                console.start("quote")
-                wait_done()
-                assert "模拟固定样本" in console.quote_text.get()
-                assert "roundtrip" not in console.action_buttons
-                assert len(console.symbol_box.cget("values")) >= 2
+                assert not console.rows
+                assert console.symbol.get() == ""
+                assert tuple(console.symbol_box.cget("values")) == ()
+                assert console.manual_price.get() == ""
+                assert console.quantity.get() == ""
+                assert not hasattr(console, "configure_symbol_button")
+                console.symbol.set("159570")
+                console.quantity.set("100")
+                console.manual_price.set("1.365")
                 console.start("buy")
                 wait_done()
-                assert len(console.rows) == 1, "a buy must never create an automatic sell"
+                assert len(console.rows) == 1
+                first = next(iter(console.rows.values()))
+                assert first["plan"]["symbol"] == "159570"
+                assert first["plan"]["quantity"] == 100
+                assert first["status"] == "FILLED"
+                console.manual_price.set("1.371")
                 console.start("sell")
                 wait_done()
-                orders = list(console.rows.values())
-                assert len(orders) == 2
-                assert all(order["mode"] == "paper" and order["status"] == "FILLED" for order in orders)
-                assert sorted(order["plan"]["side"] for order in orders) == ["buy", "sell"]
-                assert all(order["filled_quantity"] == 100 for order in orders)
+                assert len(console.rows) == 2
+                assert all(row["status"] == "FILLED" for row in console.rows.values())
+                console.symbol.set("000967.SZ")
+                console.quantity.set("7")
+                console.manual_price.set("6.931")
+                console.start("buy")
+                wait_done()
+                assert any(row["plan"]["symbol"] == "000967.SZ" and row["plan"]["quantity"] == 7
+                           and row["plan"]["limit_price"] == "6.931" for row in console.rows.values())
                 console.start("account")
                 wait_done()
-                assert "99999" in console.account_text.get()
-                assert "paper" in console.account_text.get()
-                assert len(console.positions_table.get_children()) == 1
+                assert len(console.positions_table.get_children()) == 2
                 assert console.tabs.select() == str(console.account_tab)
-                # GUI quantity must reach the real worker and simulated ledger.
-                console.quantity.set("300")
-                console.start("buy")
-                wait_done()
-                assert any(o["plan"]["quantity"] == 300 and o["filled_quantity"] == 300 for o in console.rows.values())
-                count = len(console.rows)
-                console.quantity.set("101")
+                console.positions_table.selection_set(console.positions_table.get_children()[-1])
+                console.select_position()
+                assert console.symbol.get() == "000967.SZ"
+                assert "000967.SZ" in console.symbol_box.cget("values")
+                before = len(console.rows)
+                console.quantity.set("0")
                 console.start("sell")
-                wait_done()
-                assert len(console.rows) == count
-                console.quantity.set("100")
-                console.symbol.set("510300.SH")
-                console.change_symbol()
-                console.quantity.set("200")
+                assert not console.busy and len(console.rows) == before
+                console.symbol.set("invalid")
                 console.start("buy")
-                wait_done()
-                assert any(o['plan']['symbol'] == '510300.SH' and o['plan']['quantity'] == 200 for o in console.rows.values())
-                # Closed-market snapshots must be visible, with no real session.
-                (project / "config/ths.local.json").write_text(
-                    (project / "config/ths.example.json").read_text(encoding="utf-8"), encoding="utf-8")
-                closed = Quote("000001.SZ", Decimal("0"), Decimal("0"), utc_now(),
-                               last=Decimal("1.365"), session="已收盘")
-                with patch("easytrade.console.UserSession", return_value=SimpleNamespace(quote=lambda symbol: closed, orders=lambda: [], set_quote_source=lambda source: None)):
-                    console.mode.set("实盘（测试中）")
-                    console.start("quote")
-                    wait_done()
-                assert "已收盘" in console.quote_text.get()
-                assert "最新成交1.365" in console.quote_text.get()
-                console.mode.set("模拟（不连接客户端）")
-                console.start("list")
-                wait_done()
+                assert not console.busy and len(console.rows) == before
                 console.start("refresh")
                 wait_done()
-                assert len(console.broker_table.get_children()) == len(console.rows)
-                assert console.tabs.select() == str(console.broker_tab)
-                assert "paper" in console.broker_text.get()
-                console.start("check")
-                wait_done()
-                assert console.tabs.select() == str(console.check_tab)
-                assert "模拟检查不代表实际客户端已适配" in console.check_text.get()
-                assert "待人工核对" in console.check_view.get("1.0", "end")
-                assert (project / "runtime/client-check-paper.json").is_file()
-                # Exercise the visible recovery guidance with in-memory rows only.
-                # Setting the StringVar does not dispatch a live action/session.
-                pending = {**orders[0], "signal_id": "old-draft", "mode": "ths-draft",
-                           "status": "READY_FOR_MANUAL_SUBMIT", "broker_order_id": None}
-                console.rows["old-draft"] = pending
-                console.table.insert("", "end", iid="old-draft")
-                selected = console.table.selection()
-                if selected:
-                    console.table.selection_remove(*selected)
-                console.mode.set("实盘（本机提交尚待验证）")
-                console.update_pending_hint()
-                assert "核对未提交" in console.pending_hint.get()
-                assert console.table.selection() == ("old-draft",)
-                assert all(str(button.cget("state")) == "normal" for button in console.trade_buttons)
-                console.update_recovery_buttons()
-                assert str(console.action_buttons["discard"].cget("state")) == "normal"
-                assert str(console.action_buttons["cancel"].cget("state")) == "disabled"
-                assert str(console.action_buttons["resume"].cget("state")) == "disabled"
-                pending["mode"], pending["status"] = "ths-user", "UNKNOWN"
-                console.update_pending_hint()
-                assert all(str(button.cget("state")) == "normal" for button in console.trade_buttons)
-                console.update_recovery_buttons()
-                assert str(console.action_buttons["resume"].cget("state")) == "normal"
-                assert str(console.action_buttons["query"].cget("state")) == "disabled"
-                console.broker_id.set("12345")
-                assert str(console.action_buttons["query"].cget("state")) == "normal"
-                pending["status"], pending["broker_order_id"] = "BROKER_ACCEPTED", "12345"
-                console.update_pending_hint()
-                assert all(str(button.cget("state")) == "normal" for button in console.trade_buttons)
-                console.set_busy(True)
-                assert all(str(button.cget("state")) == "disabled" for button in console.trade_buttons)
-                console.set_busy(False)
-                assert all(str(button.cget("state")) == "normal" for button in console.trade_buttons)
-                console.mode.set("模拟（不连接客户端）")
-                console.update_pending_hint()
-                assert all(str(button.cget("state")) == "normal" for button in console.trade_buttons)
-                journal = [json.loads(line) for line in (project / "runtime/console-actions.jsonl").read_text(encoding="utf-8").splitlines()]
-                assert any(entry["event"] == "action_started" and entry["action"] == "buy" for entry in journal)
-                assert not any(entry.get("action") == "roundtrip" for entry in journal)
-                assert any(entry["event"] == "action_finished" and "elapsed_ms" in entry for entry in journal)
-                assert any(entry["event"] == "order_snapshot" and len(entry["orders"]) == 2 for entry in journal)
-                print(json.dumps({"gui": "Tk 8.6", "startup_orders": 0, "independent_orders": len(orders),
-                                  "all_filled": True, "native_adapter_constructed": False,
-                                  "multiple_symbols": True, "no_automatic_roundtrip": True,
-                                  "historical_orders_do_not_disable_new_requests": True,
-                                  "quantity_and_account_tab": True,
-                                  "read_only_client_check": True,
-                                  "recovery_button_states_and_action_journal": True,
-                                  "database": "temporary and removed"}, ensure_ascii=False))
+                assert len(console.broker_table.get_children()) == 3
+                assert not (project / "config/paper.local.json").exists()
+                assert json.loads((project / "config/paper.example.json").read_text())["instruments"] == {}
+                print(json.dumps({"gui":"Tk", "startup_orders":0, "preconfigured_symbols":0,
+                                  "explicit_buy_sell":True, "arbitrary_code_quantity_price":True,
+                                  "account_and_orders":True, "native_adapter_constructed":False}))
             finally:
                 console.close()
 

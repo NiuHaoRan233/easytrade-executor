@@ -1,13 +1,38 @@
 name: Tests
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
       - run: python -m pip install -e ".[windows,test]"
       - run: python -X utf8 -m unittest discover -s tests -v
       - run: python -X utf8 tools/console_smoke.py
+      - run: python -X utf8 -m easytrade.doctor --mode paper --json
+      - run: python -X utf8 tools/build_share.py
+  ocr-startup:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - if: matrix.python == '3.13'
+        run: python -m pip install --only-binary=:all: -c constraints/windows-py313-tested.txt -e ".[windows,ocr]"
+      - if: matrix.python != '3.13'
+        run: python -m pip install --only-binary=:all: -e ".[windows,ocr]"
+      - run: python -X utf8 -m easytrade.doctor --mode paper --warm-ocr --json

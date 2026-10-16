@@ -11,11 +11,13 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[windows,ocr]"
 ```
 
-双击 `Start-Test-Console.cmd`，默认模拟账户 `demo`，初始资金 100000，样例证券 `000001.SZ` 和 `510300.SH`。分别测试买卖与查询，模拟报价是固定样例。
+双击 `Start-Test-Console.cmd`，默认模拟账户 `demo`，初始资金100000。输入模型传入的代码、数量、明确限价，分别测试买卖与查询；没有预置证券名单，也不自动生成模拟盘口。
 
 模拟账本会持久化，修改初始资金不覆盖旧账本。另起环境可把分享包解到新目录，或备份后移走 `runtime/console-paper.sqlite` 再启动；不要删除整个实盘运行目录。
 
 ## 本机实盘配置
+
+优先使用 `Check-Environment.cmd`检查环境，自行登录交易端后运行 `Configure-Client.cmd`。它只读发现实际程序路径和常见账户区域，询问身份片段并生成本机配置，不覆盖已有文件。随后仍需只读验收。发现不了窗口或身份区域时按下表人工配置，详见[新电脑快速适配指南](first-machine.md)。
 
 复制 `config/ths.example.json` 为 `config/ths.local.json`，修改：
 
@@ -28,12 +30,12 @@ py -3.12 -m venv .venv
 | `caption_identity_box` | 标题身份截图区域；标题/DPI 变化需校准，不要删除身份要求绕过核对 |
 | `ths_profile.pages` | 左侧页面树路径，与实际客户端文字一致 |
 | `tree_control_id`、`grid_control_id`、`grid_class` | 原生控件标识，其他布局需适配 |
-| `default_symbol`、`instruments` | 默认证券、允许交易证券的名称、`lot_size`、`price_tick` |
+| `instruments` | 兼容字段，可留空；统一实盘接口不以它限制证券，无需逐只配置 |
 | `quote_source` | 默认 `ths_client`，主动选择 Web 为 `tencent_web` |
-| `pretrade_account` | 默认 `true`，每笔新实盘指令前读账户；`false` 可省这次读取 |
+| `pretrade_account` | 默认 `false`，明确指令直接执行；`true` 可按需启用委托前账户读取 |
 | `buy_fee_reserve` | 买入预算的费用预留，不是券商真实费率模型 |
 
-证券名称须与客户端核对兼容，不能随意使用备注。当前 `lot_size` 校验固定正整数倍，不能假设所有股票、ETF、债券与零股都按 100 交易。`.SH/.SZ/.BJ` 是可解析格式，具体客户端支持情况仍需验收。
+证券名称由客户端识别，显式数量和限价直接传递，实际申报单位及价格单位由券商核验。代码支持六位数字及附.SH/.SZ/.BJ的格式；旧版市场选择框和Web行情需要市场后缀。不要把持仓市价自动当作委托限价。
 
 用户先打开并登录同花顺交易客户端。两者使用相同 Windows 权限级别，桌面解锁、窗口可见、DPI 与布局稳定。执行时不要切换前台或干预键鼠。
 

@@ -53,15 +53,29 @@ class GatewayTests(unittest.TestCase):
             self.session.execute({**raw, "quantity": 200})
         self.assertEqual(len(self.native.submitted), 2)
 
-    def test_invalid_rules_unknown_symbol_account_and_expiry_never_submit(self):
-        for raw in [message(symbol="999999.SZ"), message(quantity=101), message(price="10.001"),
-                    message(symbol="510300.SH", quantity=100), {**message(), "account": "other"}]:
+    def test_invalid_input_account_and_expiry_never_submit(self):
+        for raw in [message(symbol="not-a-code"), message(quantity=0), message(price="0"),
+                    message(quantity=True), {**message(), "account": "other"}]:
             with self.subTest(raw=raw), self.assertRaises(ValidationError):
                 self.session.execute(raw)
         raw = {**message(), "expires_at": (utc_now() - timedelta(seconds=1)).isoformat()}
         self.native.read_account = lambda: self.fail("expired signal must not query client")
         self.assertEqual(self.session.execute(raw)["status"], "EXPIRED")
         self.assertFalse(self.native.submitted)
+
+    def test_model_code_quantity_and_price_need_no_security_preconfiguration(self):
+        config = configuration()
+        config["instruments"] = {}
+        config.pop("default_symbol", None)
+        config.pop("pretrade_account", None)
+        self.native.read_account = lambda: self.fail("explicit execution must not add account OCR")
+        session = UserSession(self.tmp.name, config, live=True, adapter=self.native)
+        for index, (code, quantity, price) in enumerate((("000967", 101, "6.931"), ("300672.SZ", 7, "137.02"))):
+            raw = message("unconfigured-" + str(index), code, quantity=quantity, price=price)
+            self.assertEqual(session.execute(raw)["status"], "BROKER_ACCEPTED")
+            self.assertTrue(session.execute(raw)["replayed"])
+        self.assertEqual([(p.symbol, p.quantity, p.limit_price) for p in self.native.submitted],
+                         [("000967", 101, "6.931"), ("300672.SZ", 7, "137.02")])
 
     def test_pretrade_account_is_fresh_before_each_new_order_but_not_replay(self):
         calls = []
@@ -132,6 +146,7 @@ class GatewayTests(unittest.TestCase):
         config = configuration()
         del config["ths_profile"]
         config["account"] = "test"
+        config["paper_quotes"] = {"510300.SH": {"bid":"3.499", "ask":"3.500"}}
         with unittest.mock.patch("easytrade.user_native.ThsUserAdapter", side_effect=AssertionError("native forbidden")):
             paper = UserSession(self.tmp.name, config)
             self.assertEqual(paper.execute(message(price="1.00"))["status"], "FILLED")

@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from .domain import utc_now
 
-CONSOLE_BUILD = "20261016.12"
+CONSOLE_BUILD = "20261016.17"
 _write_lock = threading.Lock()
 
 

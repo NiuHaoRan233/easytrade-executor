@@ -16,8 +16,9 @@ from easytrade.quotes import Quote, QuoteUnavailable, parse_tencent
 from easytrade.tables import TableSnapshot, normalize
 from easytrade.user_native import ThsUserAdapter, confirmation_matches, matching_row, positive_button_id
 from easytrade.user_session import UserSession
+from easytrade.adapters import BrokerRejectedError
 
-CONFIG = {"session_lock": "runtime/live.lock", "buy_fee_reserve": "5", "accounts": {"test": {}},
+CONFIG = {"session_lock": "runtime/live.lock", "buy_fee_reserve": "5", "pretrade_account": True, "accounts": {"test": {}},
           "instruments": {"159570.SZ": {"name": "港股通创新药ETF", "lot_size": 100, "price_tick": "0.001"}},
           "ths_profile": {"account_alias": "test", "pages": {"buy": ["buy"], "sell": ["sell"]}}}
 
@@ -126,8 +127,32 @@ class QuoteTests(unittest.TestCase):
         self.assertIn("已收盘", text)
         self.assertIn("最新成交1.365（仅供查看）", text)
         for side in ("buy", "sell"):
-            with self.assertRaisesRegex(QuoteUnavailable, "已收盘"):
+            with self.assertRaisesRegex(QuoteUnavailable, "盘口为空"):
                 quote.price(side, now=quote.observed_at)
+
+    def test_calendar_notices_allow_freshly_captured_last_book_for_limit_orders(self):
+        moment = utc_now()
+        for notice in ("已收盘", "休市时段", "尚未开盘", "午间休市"):
+            with self.subTest(notice=notice):
+                quote = self.quote(observed_at=moment-timedelta(hours=3), captured_at=moment, session=notice)
+                self.assertEqual(quote.price("buy", now=moment), "1.401")
+                self.assertEqual(quote.price("sell", now=moment), "1.400")
+                self.assertIn("不阻止限价委托", quote.describe(now=moment))
+
+    def test_after_hours_keeps_snapshot_age_future_time_and_invalid_book_checks(self):
+        moment = utc_now()
+        base = dict(observed_at=moment-timedelta(hours=3), captured_at=moment, session="已收盘")
+        for updates in ({"captured_at":moment-timedelta(seconds=6)}, {"captured_at":moment+timedelta(seconds=2)},
+                        {"observed_at":moment+timedelta(seconds=2)}, {"bid":Decimal("0")},
+                        {"bid":Decimal("2")}, {"ask_quantity":0}, {"session":"停牌"}):
+            with self.subTest(updates=updates), self.assertRaises(QuoteUnavailable):
+                self.quote(**{**base, **updates}).price("buy", now=moment)
+
+    def test_intraday_capture_time_does_not_override_stale_market_time(self):
+        moment = utc_now()
+        quote = self.quote(observed_at=moment-timedelta(seconds=6), captured_at=moment)
+        with self.assertRaisesRegex(QuoteUnavailable, "过期"):
+            quote.price("buy", now=moment)
 
     def test_intraday_empty_book_and_one_sided_volume_are_not_fabricated(self):
         quote = parse_tencent(self.provider_snapshot(moment="20261016140354"))
@@ -215,7 +240,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(self.native.submitted), 1)
 
     def test_invalid_quantity_does_not_create_or_prepare_order(self):
-        for quantity in (0, -100, 101, True, "100"):
+        for quantity in (0, -100, True, "100"):
             with self.subTest(quantity=quantity), self.assertRaises(ValidationError):
                 self.session.submit("buy", quantity=quantity)
         self.assertEqual(self.native.prepared, [])
@@ -372,15 +397,55 @@ class SessionTests(unittest.TestCase):
         self.session.quote_provider = lambda: self.fail("manual price must not fetch quotes")
         self.assertEqual(self.session.submit("buy", manual_price="1.401")["status"], "BROKER_ACCEPTED")
 
+    def test_bound_broker_rejection_is_terminal_without_inventing_a_broker_id_or_retry(self):
+        def reject(plan, instrument, persist):
+            self.native.submitted.append(plan)
+            raise BrokerRejectedError("低延时98客户不支持夜市", code="-150906115")
+        self.native.submit_prepared = reject
+        result = self.session.submit("buy", manual_price="1.401", signal_id="night-reject")
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertIsNone(result["broker_order_id"])
+        self.assertEqual(result["detail"]["broker_error_code"], "-150906115")
+        self.assertEqual(self.session.submit("buy", manual_price="1.401", signal_id="night-reject")["status"], "REJECTED")
+        self.assertEqual(len(self.native.submitted), 1)
+
     def test_unavailable_book_does_not_create_order_and_manual_price_is_independent(self):
         self.session.quote_provider = lambda: Quote("159570.SZ", Decimal("0"), Decimal("0"), utc_now(),
                                                     last=Decimal("1.365"), session="已收盘")
-        with self.assertRaisesRegex(QuoteUnavailable, "已收盘"):
+        with self.assertRaisesRegex(QuoteUnavailable, "盘口为空"):
             self.session.submit("buy", signal_id="no-book")
         self.assertEqual(self.session.orders(), [])
         self.assertEqual(self.native.prepared, [])
         self.assertEqual(self.session.submit("buy", manual_price="1.365", signal_id="manual")["status"], "BROKER_ACCEPTED")
         self.assertEqual(self.native.submitted[0].limit_price, "1.365")
+
+    def test_after_hours_buy_and_sell_follow_normal_submission_and_pending_receipts(self):
+        self.session.quote_provider = lambda: Quote("159570.SZ", Decimal("1.400"), Decimal("1.401"),
+            utc_now()-timedelta(hours=3), captured_at=utc_now(), session="已收盘")
+        self.native.query_status = "BROKER_ACCEPTED"
+        for side, price in (("buy","1.401"), ("sell","1.400")):
+            with self.subTest(side=side):
+                result = self.session.submit_and_follow(side, quantity=100, signal_id="closed-"+side, wait_seconds=0)
+                self.assertEqual(result["status"], "BROKER_ACCEPTED")
+                self.assertEqual(result["filled_quantity"], 0)
+                self.assertEqual(Decimal(self.native.submitted[-1].limit_price), Decimal(price))
+                self.assertEqual(self.session.query(result["signal_id"])["status"], "BROKER_ACCEPTED")
+                replay = self.session.submit(side, quantity=100, signal_id="closed-"+side)
+                self.assertEqual(replay["broker_order_id"], result["broker_order_id"])
+        self.assertEqual(len(self.native.submitted), 2)
+
+    def test_after_hours_does_not_fabricate_an_accepted_or_unfilled_receipt(self):
+        self.session.quote_provider = lambda: Quote("159570.SZ", Decimal("1.400"), Decimal("1.401"),
+            utc_now()-timedelta(hours=3), captured_at=utc_now(), session="已收盘")
+        def reject(plan, instrument, persist):
+            self.native.submitted.append(plan)
+            persist({"receipt_id":"closed-reject", "account":plan.account, "symbol":plan.symbol, "side":plan.side,
+                     "broker_order_id":"rejected-1", "status":"REJECTED", "filled_quantity":0,
+                     "average_price":"0", "observed_at":utc_now().isoformat(), "source":"win32"})
+        self.native.submit_prepared = reject
+        result = self.session.submit("buy", signal_id="closed-rejected")
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertEqual(len(self.native.submitted), 1)
 
     def test_moved_book_does_not_submit_and_clears_fields(self):
         calls = iter(["1.401", "1.402"])
@@ -462,7 +527,7 @@ class SessionTests(unittest.TestCase):
     def test_independent_paper_orders_do_not_construct_native_adapter(self):
         with patch("easytrade.user_native.ThsUserAdapter", side_effect=AssertionError("native forbidden")):
             paper = UserSession(self.tmp.name, CONFIG)
-            result = [paper.submit("buy", signal_id="paper-buy"), paper.submit("sell", signal_id="paper-sell")]
+            result = [paper.submit("buy", manual_price="1.401", signal_id="paper-buy"), paper.submit("sell", manual_price="1.400", signal_id="paper-sell")]
             self.assertEqual([r["status"] for r in result], ["FILLED", "FILLED"])
             self.assertTrue(all(r["mode"] == "paper" for r in result))
             with paper.store.connect() as db:
@@ -635,6 +700,32 @@ class NativeContractTests(unittest.TestCase):
         self.assertEqual(self.clicks, ["submit"])
         self.assertEqual(self.events, ["close-ORDER_CONFIRMATION", "persist", "close-ORDER_ACCEPTED"])
         self.assertEqual(receipts[0]["filled_quantity"], 0)
+
+    def test_night_channel_rejection_requires_matching_confirmation_and_never_clicks_again(self):
+        error = {"kind":"REJECTION", "text":"提交失败：ABPCall[900005]=-410411020[-150906115]低延时98客户不支持夜市", "source":"win32"}
+        native = self.native([{"kind":"ORDER_CONFIRMATION", "text":self.text}, error])
+        with self.assertRaises(BrokerRejectedError):
+            native.submit_prepared(self.plan, SimpleNamespace(name="港股通创新药ETF"), lambda r:self.fail("not an acceptance"))
+        self.assertEqual(self.clicks, ["submit"])
+        self.assertEqual(self.events, ["close-ORDER_CONFIRMATION"])
+        native = self.native([error])
+        with self.assertRaises(ValidationError):
+            native.submit_prepared(self.plan, SimpleNamespace(name="港股通创新药ETF"), lambda r:self.fail("not bound"))
+
+    def test_dynamic_security_requires_the_name_verified_in_this_preparation(self):
+        native = self.native([])
+        native._prepared_security = {"code":"159570", "name":"different security", "side":"buy"}
+        with self.assertRaisesRegex(ValidationError, "证券身份"):
+            native.submit_prepared(self.plan, SimpleNamespace(name=""), lambda receipt: self.fail("unexpected receipt"))
+        self.assertEqual(self.clicks, [])
+
+    def test_dynamic_security_submits_once_after_native_name_binding(self):
+        native = self.native([{"kind":"ORDER_ACCEPTED", "text":"", "broker_order_id":"123", "source":"win32"}])
+        native._prepared_security = {"code":"159570", "name":"港股通创新药ETF", "side":"buy"}
+        receipts = []
+        native.submit_prepared(self.plan, SimpleNamespace(name=""), receipts.append)
+        self.assertEqual(self.clicks, ["submit"])
+        self.assertEqual(len(receipts), 1)
 
     def test_resume_validates_account_and_original_modal_without_submit_button(self):
         confirm = {"handle": 20, "kind": "ORDER_CONFIRMATION", "text": self.text}

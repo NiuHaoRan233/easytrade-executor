@@ -34,6 +34,7 @@ class PanelTests(unittest.TestCase):
         quote = self.parse()
         self.assertEqual(quote.source, "ths_client")
         self.assertEqual(quote.time_kind, "client_display_time")
+        self.assertEqual(quote.captured_at, self.now)
         self.assertEqual(quote.last, Decimal("1.365"))
         self.assertEqual(quote.change_percent, Decimal("2.094"))
         self.assertEqual(len(quote.bids), 5)

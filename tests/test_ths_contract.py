@@ -86,6 +86,9 @@ class Reset(Control):
     def __init__(self, main):
         self.main = main
 
+    def window_text(self):
+        return "重填"
+
     def click(self):
         for field in (1032, 1033, 1034):
             self.main.controls[field].value = ""
@@ -99,6 +102,8 @@ class Window:
         self.controls[1032].changed = lambda value: setattr(self.controls[1036], "value", "盈峰环境" if value else "")
         self.controls[129] = Tree(self)
         self.controls[1007] = Reset(self)
+        for key, control in self.controls.items():
+            control.control_id = lambda key=key: key
 
     def window_text(self):
         return "网上股票交易系统5.0 - 国泰君安证券(TEST)"
@@ -175,6 +180,8 @@ class ThsContractTests(unittest.TestCase):
         adapter = ThsDraftAdapter(profile)
         adapter.main = Window()
         adapter.main.page = profile["pages"]["buy"]
+        adapter._has_visible_control = lambda control_id, class_name: any(
+            c.is_visible() for c in adapter.main.descendants(control_id=control_id, class_name=class_name))
         return adapter
 
     def test_connect_does_not_restore_a_user_sized_or_maximized_window(self):
@@ -238,6 +245,7 @@ class ThsContractTests(unittest.TestCase):
                 original = self.make_adapter()
                 adapter = ThsUserAdapter(original.profile)
                 adapter.main = original.main
+                adapter._has_visible_control = original._has_visible_control
                 adapter.main.controls[1016].value = "0"
                 adapter.read_table = lambda role: self.fail("submission must not depend on OCR positions")
                 plan = build_plan(Signal.parse(signal(side=side)), instrument, Decimal("0"))
@@ -255,12 +263,14 @@ class ThsContractTests(unittest.TestCase):
         rect = SimpleNamespace(left=0, top=0, width=lambda: 1000, height=lambda: 500)
         adapter.main.rectangle = lambda: rect
         adapter.main.capture_as_image = lambda: Image.new("RGB", (1000, 500), "white")
-        chart = SimpleNamespace(wrapper_object=lambda: SimpleNamespace(rectangle=lambda: SimpleNamespace(left=680, top=88, bottom=320)))
+        chart = SimpleNamespace(wrapper_object=lambda: SimpleNamespace(handle=20))
         adapter.main.handle = 10
         desktop = SimpleNamespace(window=lambda **kwargs: SimpleNamespace(child_window=lambda **kwargs: chart))
         adapter.reader._recognize = lambda image: None
         quote = object()
-        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Desktop=lambda **kwargs: desktop)}), patch("easytrade.native_quotes.parse_panel", return_value=quote):
+        gui = SimpleNamespace(IsWindow=lambda h: True, IsWindowVisible=lambda h: True, IsChild=lambda p,h: True, GetWindowRect=lambda h: (680,88,900,320))
+        structures = SimpleNamespace(RECT=lambda *args: SimpleNamespace(left=680,top=88,right=900,bottom=320))
+        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Desktop=lambda **kwargs: desktop), "win32gui": gui, "pywinauto.win32structures": structures}), patch("easytrade.screen_capture.capture_region", return_value=Image.new("RGB", (250,232))), patch("easytrade.native_quotes.parse_panel", return_value=quote):
             self.assertIs(adapter.read_quote("159570.SZ", Instrument("港股通创新药ETF", 100, Decimal(".001"))), quote)
         self.assertEqual([adapter.main.controls[i].value for i in (1032,1033,1034)], ["159570", "1.364", "200"])
         adapter.main.controls[1032].value = "000967"
@@ -277,14 +287,44 @@ class ThsContractTests(unittest.TestCase):
         adapter.main.handle = 10
         adapter.main.rectangle = lambda: SimpleNamespace(left=0, top=0, width=lambda: 1000, height=lambda: 500)
         adapter.main.capture_as_image = lambda: Image.new("RGB", (1000, 500), "white")
-        chart = SimpleNamespace(wrapper_object=lambda: SimpleNamespace(rectangle=lambda: SimpleNamespace(left=680, top=88, bottom=320)))
+        chart = SimpleNamespace(wrapper_object=lambda: SimpleNamespace(handle=20))
         desktop = SimpleNamespace(window=lambda **kwargs: SimpleNamespace(child_window=lambda **kwargs: chart))
         adapter.reader._recognize = lambda image: None
-        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Desktop=lambda **kwargs: desktop)}), patch("easytrade.native_quotes.parse_panel", return_value="quote"):
+        gui = SimpleNamespace(IsWindow=lambda h: True, IsWindowVisible=lambda h: True, IsChild=lambda p,h: True, GetWindowRect=lambda h: (680,88,900,320))
+        structures = SimpleNamespace(RECT=lambda *args: SimpleNamespace(left=680,top=88,right=900,bottom=320))
+        with patch.dict("sys.modules", {"pywinauto": SimpleNamespace(Desktop=lambda **kwargs: desktop), "win32gui": gui, "pywinauto.win32structures": structures}), patch("easytrade.screen_capture.capture_region", return_value=Image.new("RGB", (250,232))), patch("easytrade.native_quotes.parse_panel", return_value="quote"):
             self.assertEqual(adapter.read_quote("510300.SH", Instrument("沪深300", 100, Decimal(".001"))), "quote")
         self.assertEqual(adapter.main.controls[1003].value, "上海A股")
         self.assertEqual(adapter.main.controls[1032].value, "510300")
         self.assertEqual([adapter.main.controls[i].value for i in (1033,1034)], ["", ""])
+
+    def test_visible_control_lookup_rejects_unrelated_account_combo_and_hidden_market(self):
+        adapter = ThsDraftAdapter({})
+        adapter.main = SimpleNamespace(handle=10)
+        gui = SimpleNamespace(EnumChildWindows=lambda h, callback, context: [callback(i, context) for i in (1,2)],
+            GetDlgCtrlID=lambda h: {1:1003, 2:2322}[h], GetClassName=lambda h: "ComboBox", IsWindowVisible=lambda h: h==2)
+        with patch.dict("sys.modules", {"win32gui": gui}):
+            self.assertFalse(adapter._has_visible_control(1003, "ComboBox"))
+            self.assertTrue(adapter._has_visible_control(2322, "ComboBox"))
+
+    def test_modern_form_resolves_an_unconfigured_code_without_market_or_reset_buttons(self):
+        from easytrade.user_native import ThsUserAdapter
+        original = self.make_adapter()
+        adapter = ThsUserAdapter(original.profile)
+        adapter.main = original.main
+        adapter._has_visible_control = original._has_visible_control
+        del adapter.main.controls[1003]
+        del adapter.main.controls[1007]
+        adapter.main.controls[3001] = Control("证券代码")
+        generic = Instrument("", 1, Decimal("0.000000000001"))
+        raw = signal()
+        raw.update(symbol="000967", quantity=101, limit_price="6.931")
+        plan = build_plan(Signal.parse(raw), generic, Decimal("0"))
+        result = adapter.prepare(plan, generic)
+        self.assertEqual(result["verified"], {"code":"000967", "price":"6.931", "quantity":"101", "name":"盈峰环境"})
+        self.assertFalse(result["submitted"])
+        self.assertTrue(adapter.clear_draft())
+        self.assertEqual([adapter._read_edit(i) for i in (1032,1033,1034)], ["", "", ""])
 
     def position_reader(self):
         adapter = self.make_adapter()
@@ -406,6 +446,36 @@ class ThsContractTests(unittest.TestCase):
             win32.GetScrollInfo = lambda *args: (0, None, None, 3, 0, 0)
             with self.assertRaisesRegex(Exception, "范围信息不完整"):
                 adapter._position_scroller()
+
+    def test_navigation_descendant_scrollbar_is_never_used_for_the_grid(self):
+        # Real pywinauto children(class_name=...) includes nested descendants.
+        # Reproduce the outer MDI frame returning both the grid and menu bars.
+        from easytrade.ths import TableScrollBar
+        adapter = self.make_adapter()
+        main = SimpleNamespace(handle=10)
+        frame = SimpleNamespace(handle=50, parent=lambda: main)
+        menu = SimpleNamespace(handle=60, parent=lambda: frame)
+        parent = SimpleNamespace(handle=30, parent=lambda: frame)
+        def bar(handle, owner):
+            return SimpleNamespace(handle=handle, parent=lambda: owner, is_visible=lambda: True,
+                                   rectangle=lambda: SimpleNamespace(height=lambda: 100, width=lambda: 15))
+        menu_bar, grid_bar = bar(70, menu), bar(40, parent)
+        grid = SimpleNamespace(handle=20, parent=lambda: parent, children=lambda **kwargs: [])
+        parent.children = lambda **kwargs: [grid_bar]
+        frame.children = lambda **kwargs: [grid_bar, menu_bar]
+        adapter.main, adapter._control = main, lambda *args: grid
+        win32 = SimpleNamespace(GetWindowLong=lambda *args: 0, GetScrollInfo=lambda *args: (0, 0, 9, 3, 0, 0))
+        with patch.dict("sys.modules", {"win32gui": win32}):
+            self.assertEqual(adapter._position_scroller().handle, grid_bar.handle)
+            parent.children = lambda **kwargs: []
+            frame.children = lambda **kwargs: [menu_bar]
+            self.assertIsNone(adapter._position_scroller())
+
+    def test_empty_trade_form_does_not_require_a_reset_button(self):
+        adapter = self.make_adapter()
+        with patch.object(adapter.main, "child_window", wraps=adapter.main.child_window) as lookup:
+            self.assertTrue(adapter.clear_draft())
+        self.assertFalse(any(call.kwargs.get("control_id") == 1007 for call in lookup.call_args_list))
 
     def test_ignored_setter_uses_full_clear_and_virtual_keys(self):
         adapter = self.make_adapter()

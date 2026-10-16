@@ -1,6 +1,5 @@
 {
   "account": "demo",
-  "default_symbol": "000001.SZ",
   "session_lock": "runtime/paper.lock",
   "buy_fee_reserve": "0",
   "accounts": {
@@ -9,12 +8,5 @@
       "holdings": {}
     }
   },
-  "instruments": {
-    "000001.SZ": {"name": "平安银行", "lot_size": 100, "price_tick": "0.01"},
-    "510300.SH": {"name": "沪深300", "lot_size": 100, "price_tick": "0.001"}
-  },
-  "paper_quotes": {
-    "000001.SZ": {"bid": "10.00", "ask": "10.01"},
-    "510300.SH": {"bid": "3.499", "ask": "3.500"}
-  }
+  "instruments": {}
 }
