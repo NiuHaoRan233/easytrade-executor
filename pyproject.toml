@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "easytrade-executor"
-version = "0.2.2"
+version = "0.2.3"
 description = "Local THS trading gateway with model signal API, account queries and desktop test console"
 requires-python = ">=3.11"
 dependencies = []

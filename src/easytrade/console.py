@@ -19,6 +19,10 @@ ROOT = Path.cwd()
 STATUSES = {"FILLED": "全部成交", "BROKER_ACCEPTED": "已受理/待成交", "PARTIALLY_FILLED": "部分成交",
             "UNKNOWN": "状态未知，禁止重发", "CANCELLED": "已撤", "REJECTED": "已拒绝",
             "READY_FOR_MANUAL_SUBMIT": "旧草稿，须核对", "PREPARATION_FAILED": "准备失败/已作废"}
+ACTION_LABELS = {"list": "读取本地记录", "quote": "刷新盘口", "buy": "买入", "sell": "卖出",
+                 "account": "刷新账户/持仓", "refresh": "刷新委托状态", "check": "客户端适配检查",
+                 "query": "查询回执", "resume": "接续原回执", "cancel": "撤单", "discard": "核对未提交",
+                 "resolve_unsubmitted": "核对未提交"}
 
 
 class Console:
@@ -40,22 +44,25 @@ class Console:
         self.quote_source = tk.StringVar(value="同花顺客户端（默认）")
         self.banner = tk.StringVar()
         self.pending_hint = tk.StringVar(value="")
+        self.result_text = tk.StringVar(value="就绪 · 操作结果会显示在这里，详细过程见下方运行日志。")
         self.quote_text = tk.StringVar(value="模拟盘口：买一1.400 / 卖一1.401（固定样本，非实时）")
         self.account_text = tk.StringVar(value="账户与持仓尚未读取")
         self.broker_text = tk.StringVar(value="券商当日委托尚未读取")
         self.check_text = tk.StringVar(value="首次使用：先固定客户端窗口及列宽，切换实盘后点击“客户端适配检查”。\n只读检查，不发送买卖或撤单；完成后仍需人工逐项对照。")
         root.title("Easytrade 通用交易测试台")
-        root.geometry("1100x780")
-        root.minsize(920, 700)
-        frame = ttk.Frame(root, padding=16)
+        width = min(1140, root.winfo_screenwidth() - 60)
+        height = min(900, root.winfo_screenheight() - 90)
+        root.geometry(f"{width}x{height}")
+        root.minsize(min(1000, width), min(740, height))
+        frame = ttk.Frame(root, padding=10)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Easytrade · 买入 / 卖出 / 资金持仓 / 委托查询", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
         ttk.Label(frame, text=f"调试版本 {CONSOLE_BUILD}", foreground="#666666").pack(anchor="w")
-        self.banner_label = tk.Label(frame, textvariable=self.banner, anchor="w", justify="left", padx=10, pady=10,
+        self.banner_label = tk.Label(frame, textvariable=self.banner, anchor="w", justify="left", padx=10, pady=7,
                                      font=("Microsoft YaHei UI", 11))
-        self.banner_label.pack(fill="x", pady=(12, 8))
+        self.banner_label.pack(fill="x", pady=(8, 6))
         instrument_row = ttk.Frame(frame)
-        instrument_row.pack(fill="x", pady=(0, 8))
+        instrument_row.pack(fill="x", pady=(0, 6))
         ttk.Label(instrument_row, text="证券：").pack(side="left")
         self.symbol_box = ttk.Combobox(instrument_row, textvariable=self.symbol, state="readonly", width=19,
                                         values=tuple(self.catalog))
@@ -85,10 +92,10 @@ class Console:
         self.source_box.pack(side="left")
         self.source_box.bind("<<ComboboxSelected>>", self.change_quote_source)
         ttk.Label(source_row, text="  客户端读取失败会报明原因；可手动切换来源。").pack(side="left")
-        ttk.Label(frame, textvariable=self.quote_text, wraplength=1010).pack(anchor="w", pady=(10, 2))
+        ttk.Label(frame, textvariable=self.quote_text, wraplength=1010).pack(anchor="w", pady=(6, 2))
         ttk.Label(frame, text="盘口限价：买用卖一，卖用买一；刷新报价后再提交。限价委托不保证成交。", foreground="#555555").pack(anchor="w")
         actions = ttk.Frame(frame)
-        actions.pack(fill="x", pady=12)
+        actions.pack(fill="x", pady=(8, 6))
         self.buttons = []
         self.trade_buttons = []
         self.action_buttons = {}
@@ -102,7 +109,20 @@ class Console:
                 self.trade_buttons.append(button)
         ttk.Button(actions, text="停止后续步骤", command=self.stop_requested).pack(side="right")
         ttk.Label(frame, textvariable=self.pending_hint, foreground="#975700", wraplength=1010).pack(anchor="w", fill="x", pady=(0, 7))
-        self.tabs = ttk.Notebook(frame)
+        self.result_label = tk.Label(frame, textvariable=self.result_text, anchor="w", justify="left",
+                                     bg="#edf2f7", fg="#243746", padx=10, pady=6,
+                                     font=("Microsoft YaHei UI", 10, "bold"), wraplength=1000)
+        self.result_label.pack(fill="x", pady=(0, 8))
+        self.result_label.bind("<Configure>", lambda event: self.result_label.configure(wraplength=max(200, event.width - 24)))
+        # Reserve space for both panes; pack's earlier expanding tables used to
+        # consume the window and squeeze the last-created log out of view.
+        self.workspace = tk.PanedWindow(frame, orient="vertical", sashwidth=8, sashrelief="raised",
+                                         bd=0, opaqueresize=True)
+        self.workspace.pack(fill="both", expand=True)
+        data_pane, self.log_pane = ttk.Frame(self.workspace), ttk.Frame(self.workspace)
+        self.workspace.add(data_pane, minsize=140, stretch="always")
+        self.workspace.add(self.log_pane, minsize=145, height=195, stretch="never")
+        self.tabs = ttk.Notebook(data_pane)
         self.tabs.pack(fill="both", expand=True)
         orders_tab, account_tab, broker_tab, quote_tab = (ttk.Frame(self.tabs) for _ in range(4))
         self.account_tab = account_tab
@@ -113,6 +133,19 @@ class Console:
         self.tabs.add(quote_tab, text="行情与五档")
         self.check_tab = ttk.Frame(self.tabs)
         self.tabs.add(self.check_tab, text="首次适配检查")
+        recovery = ttk.Frame(orders_tab, padding=(6, 4))
+        recovery.pack(side="bottom", fill="x")
+        ttk.Label(recovery, text="选中记录后核对回执或撤单；UNKNOWN不自动重试，查询核对完整委托号。", foreground="#555555").pack(anchor="w")
+        row = ttk.Frame(recovery)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="补录完整委托号：").pack(side="left")
+        self.broker_entry = ttk.Entry(row, textvariable=self.broker_id, width=22)
+        self.broker_entry.pack(side="left", padx=(0, 8))
+        for label, action in (("查询选中回执", "query"), ("接续原确认/回执", "resume"), ("撤销选中委托", "cancel"), ("核对未提交", "discard")):
+            button = ttk.Button(row, text=label, command=lambda a=action: self.start(a))
+            button.pack(side="left", padx=(0, 6))
+            self.buttons.append(button)
+            self.action_buttons[action] = button
         self.check_view = tk.Text(self.check_tab, wrap="word", height=10, padx=12, pady=12, state="disabled")
         check_scroll = ttk.Scrollbar(self.check_tab, orient="vertical", command=self.check_view.yview)
         self.check_view.configure(yscrollcommand=check_scroll.set)
@@ -158,19 +191,17 @@ class Console:
         self.table.tag_configure("pending", background="#fff3d1")
         self.table.pack(fill="both", expand=True)
         self.table.bind("<<TreeviewSelect>>", self.select_order)
-        ttk.Label(frame, text="选中一行后核对回执或撤单。UNKNOWN不会自动重试；查询只核对完整委托编号。", foreground="#555555").pack(anchor="w", pady=(6, 2))
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=6)
-        ttk.Label(row, text="补录完整委托号：").pack(side="left")
-        self.broker_entry = ttk.Entry(row, textvariable=self.broker_id, width=24)
-        self.broker_entry.pack(side="left", padx=(0, 8))
-        for label, action in (("查询选中回执", "query"), ("接续原确认/回执", "resume"), ("撤销选中委托", "cancel"), ("核对未提交", "discard")):
-            button = ttk.Button(row, text=label, command=lambda a=action: self.start(a))
-            button.pack(side="left", padx=(0, 6))
-            self.buttons.append(button)
-            self.action_buttons[action] = button
-        self.log_box = tk.Text(frame, height=9, wrap="word", state="disabled", font=("Microsoft YaHei UI", 9))
-        self.log_box.pack(fill="x", pady=(8, 0))
+        ttk.Label(self.log_pane, text="运行日志 · 最新记录在下方（可拖动上方分隔条调整高度）",
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(3, 6))
+        log_body = ttk.Frame(self.log_pane)
+        log_body.pack(fill="both", expand=True)
+        self.log_box = tk.Text(log_body, height=8, wrap="word", state="disabled", padx=8, pady=6,
+                               bg="#f6f8fa", fg="#243746", font=("Microsoft YaHei UI", 10))
+        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
+        self.log_box.pack(side="left", fill="both", expand=True)
+        self.log_box.tag_configure("error", foreground="#b3261e")
         self.rows = {}
         self.broker_id.trace_add("write", lambda *args: self.update_recovery_buttons())
         self.change_banner()
@@ -240,11 +271,18 @@ class Console:
             self.broker_id.set(order["broker_order_id"] or (order["detail"] or {}).get("broker_order_id_hint") or "")
         self.update_recovery_buttons()
 
-    def append_log(self, message):
+    def show_result(self, message, level="info"):
+        colors = {"info": ("#edf2f7", "#243746"), "busy": ("#e8f0fe", "#174ea6"),
+                  "success": ("#e7f1ea", "#225a34"), "error": ("#fce8e6", "#9c2018")}
+        background, foreground = colors[level]
+        self.result_text.set(message)
+        self.result_label.configure(bg=background, fg=foreground)
+
+    def append_log(self, message, level="info"):
         from datetime import datetime
         record_action(self.project_root, "ui_message", message=message)
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", datetime.now().strftime("%H:%M:%S ") + message + "\n")
+        self.log_box.insert("end", datetime.now().strftime("%H:%M:%S ") + message + "\n", (level,))
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -305,6 +343,7 @@ class Console:
         selected = self.table.selection()
         signal_id = selected[0] if selected else None
         if action in {"query", "resume", "cancel", "discard"} and not signal_id:
+            self.show_result("未开始 · 先在本地执行记录中选中一笔订单。", "error")
             self.append_log("先在表格中选中一笔订单。")
             return
         declared_no_confirmation = False
@@ -327,14 +366,17 @@ class Console:
             raw_quantity = self.quantity.get().strip()
             lot = self.catalog[self.symbol.get()]["lot_size"]
             if not raw_quantity.isascii() or not raw_quantity.isdigit() or int(raw_quantity) <= 0 or int(raw_quantity) % lot:
+                self.show_result(f"未开始 · 数量请填写{lot}的正整数倍。", "error")
                 self.append_log(f"数量请填写{lot}的正整数倍。")
                 return
             quantity = int(raw_quantity)
         if action in {"buy", "sell"} and manual == "":
+            self.show_result("未开始 · 请填入合法限价，或选择盘口限价。", "error")
             self.append_log("请填入合法限价，或选择盘口限价。")
             return
         self.stop.clear()
         self.set_busy(True)
+        self.show_result(f"进行中 · {ACTION_LABELS.get(action, action)}，请等待结果…", "busy")
         self.tasks.put({"action": action, "live": self.mode.get().startswith("实盘"), "manual": manual,
                         "quote_source": "tencent_web" if self.quote_source.get().startswith("腾讯") else "ths_client",
                         "quantity": quantity,
@@ -418,7 +460,17 @@ class Console:
                         if report["broker_snapshot"] is not None:
                             self.messages.put(("broker_orders", report["broker_snapshot"]))
                         self.messages.put(("client_check", report))
+                    if action in {"buy", "sell"}:
+                        status = result["status"]
+                        self.messages.put(("result", (f"{ACTION_LABELS[action]} · {STATUSES.get(status, status)}；详情见记录与运行日志。",
+                            "success" if status == "FILLED" else "error" if status in {"REJECTED", "UNKNOWN", "PREPARATION_FAILED"} else "info")))
+                    elif action != "list":
+                        self.messages.put(("result", (f"{ACTION_LABELS.get(action, action)} · 操作已返回，请核对下方数据与运行日志。", "info")))
+                    else:
+                        self.messages.put(("result", ("就绪 · 本地记录已读取；每次操作结果会显示在这里，详细过程见下方运行日志。", "info")))
                 except Exception as error:
+                    self.messages.put(("result", (f"{ACTION_LABELS.get(task['action'], task['action'])}未完成 · {error}", "error")))
+                    self.messages.put(("error_log", str(error)))
                     if isinstance(error, QuoteUnavailable) or task["action"] == "quote":
                         self.messages.put(("quote", "盘口定价当前不可用：" + str(error)))
                         self.messages.put(("quote_snapshot", None))
@@ -427,7 +479,6 @@ class Console:
                     if task["action"] == "account":
                         self.messages.put(("account_error", str(error)))
                     record_action(self.project_root, "action_error", action=task["action"], request_id=task["request_id"], error=str(error), traceback=traceback.format_exc())
-                    self.messages.put(("log", str(error)))
                     log_path = self.project_root / "runtime/console-errors.log"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     with log_path.open("a", encoding="utf-8") as file:
@@ -453,6 +504,10 @@ class Console:
                 kind, value = self.messages.get_nowait()
                 if kind == "log":
                     self.append_log(value)
+                elif kind == "error_log":
+                    self.append_log(value, "error")
+                elif kind == "result":
+                    self.show_result(*value)
                 elif kind == "quote":
                     self.quote_text.set(value)
                 elif kind == "quote_snapshot":
