@@ -13,6 +13,8 @@ from .lease import session_lease
 from .quotes import Quote, fetch_quote
 from .store import Store, ConflictError
 
+DISPLAY_PRICE_KEYS = {"current_price", "market_value"}
+
 
 class UserSession:
     def __init__(self, root, config, *, live=False, adapter=None, quote_provider=None, log=lambda message: None, database=None):
@@ -162,7 +164,41 @@ class UserSession:
         path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
         self.last_account_snapshot = snapshot
         self.log(f"账户快照已更新：可用资金{snapshot['balances']['available_cash']}；可见持仓{len(snapshot['positions'])}行；{snapshot['observed_at']}")
+        for warning in snapshot.get("positions_read_warnings", []):
+            self.log("持仓显示提示：" + warning)
         return snapshot
+
+    def check_client(self):
+        """Read-only onboarding check; never proves OCR accuracy or sends orders."""
+        import json
+        checks, account, orders = [], None, None
+        try:
+            account = self.account_snapshot()
+            checks.append({"item": "账户身份与资金", "status": "已读取", "detail": "请对照客户端账户及可用资金"})
+            checks.append({"item": "持仓读取范围", "status": "已读取" if account["positions_complete"] else "需调整",
+                           "detail": "滚动范围已核对" if account["positions_complete"] else account.get("positions_incomplete_reason") or "尚未取得完整范围"})
+            rows = account["positions"]
+            missing = [r["symbol"] for r in rows if not DISPLAY_PRICE_KEYS.issubset(r)]
+            warnings = account.get("positions_read_warnings", [])
+            checks.append({"item": "持仓市价与市值", "status": "需调整" if missing or warnings else ("待人工核对" if rows else "待有持仓时核对"),
+                           "detail": "；".join(warnings) or ("部分行未取得市价/市值：" + ", ".join(missing) if missing else "读取成功不代表识别完全正确，请逐项对照小数点")})
+        except Exception as error:
+            checks.append({"item": "账户与持仓", "status": "读取失败", "detail": str(error)})
+        try:
+            orders = self.broker_orders_snapshot()
+            checks.append({"item": "券商当日委托", "status": "已读取" if orders["complete"] else "需调整",
+                           "detail": f"共{len(orders['rows'])}条；请核对完整编号、方向、数量、状态"})
+        except Exception as error:
+            checks.append({"item": "券商当日委托", "status": "读取失败", "detail": str(error)})
+        checks.append({"item": "证券行情及人工验收", "status": "待人工核对",
+                       "detail": "选择要使用的证券，单独刷新五档对照；账户、持仓、委托与报价一致后保持当前客户端大小、列宽、缩放"})
+        report = {"observed_at": utc_now().isoformat(), "mode": self.mode, "submitted": False,
+                  "manual_review_required": True, "checks": checks,
+                  "layout": account.get("positions_layout", {}) if account else {},
+                  "account_snapshot": account, "broker_snapshot": orders}
+        path = self.root / ("runtime/client-check-live.json" if self.live else "runtime/client-check-paper.json")
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return report
 
     def _submit(self, side, manual_price, signal_id, stop=None, quantity=100, *, symbol=None, explicit_signal=None):
         symbol = symbol or self.symbol
@@ -292,7 +328,8 @@ class UserSession:
             if self.live:
                 table = self.adapter.read_orders()
                 snapshot = {"account": self.account, "observed_at": table.observed_at, "source": "ths_client_ocr",
-                            "rows": table.rows, "complete": table.complete, "incomplete_reason": table.incomplete_reason}
+                            "rows": table.rows, "complete": table.complete, "incomplete_reason": table.incomplete_reason,
+                            "read_warnings": table.warnings, "layout": table.layout}
                 # Bind only exact existing requests. Broker-only rows stay visible
                 # without fabricating local signals or guessing by price/time.
                 for order in self.store.list_orders():

@@ -95,6 +95,12 @@ def main():
                 assert len(console.broker_table.get_children()) == len(console.rows)
                 assert console.tabs.select() == str(console.broker_tab)
                 assert "paper" in console.broker_text.get()
+                console.start("check")
+                wait_done()
+                assert console.tabs.select() == str(console.check_tab)
+                assert "模拟检查不代表实际客户端已适配" in console.check_text.get()
+                assert "待人工核对" in console.check_view.get("1.0", "end")
+                assert (project / "runtime/client-check-paper.json").is_file()
                 # Exercise the visible recovery guidance with in-memory rows only.
                 # Setting the StringVar does not dispatch a live action/session.
                 pending = {**orders[0], "signal_id": "old-draft", "mode": "ths-draft",
@@ -141,6 +147,7 @@ def main():
                                   "multiple_symbols": True, "no_automatic_roundtrip": True,
                                   "historical_orders_do_not_disable_new_requests": True,
                                   "quantity_and_account_tab": True,
+                                  "read_only_client_check": True,
                                   "recovery_button_states_and_action_journal": True,
                                   "database": "temporary and removed"}, ensure_ascii=False))
             finally:

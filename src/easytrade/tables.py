@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from .domain import ValidationError
@@ -27,6 +27,7 @@ ALIASES = {
 REQUIRED = {"positions": {"symbol", "available_quantity"},
             "orders": {"symbol", "side", "order_id", "quantity", "filled_quantity", "status"},
             "trades": {"symbol", "side", "order_id", "filled_quantity", "average_price", "trade_id"}}
+DISPLAY_FIELDS = {"current_price", "market_value"}
 
 
 def parse_tsv(text: str) -> list[dict[str, str]]:
@@ -124,6 +125,8 @@ class TableSnapshot:
     source: str
     complete: bool = False
     incomplete_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    layout: dict = field(default_factory=dict)
 
 
 class OcrTableReader:
@@ -184,14 +187,22 @@ class OcrTableReader:
         result = self._recognize(image)
         if result.txts is None:
             raise ValidationError("OCR没有读到表头，不能解释成空表")
-        cells = {}
+        cells, clipped_cells = {}, set()
         for text, score, box in zip(result.txts, result.scores, result.boxes):
-            cx, cy = np.asarray(box).mean(axis=0)
+            points = np.asarray(box)
+            cx, cy = points.mean(axis=0)
             column, row = bisect.bisect_right(xs, cx) - 1, bisect.bisect_right(ys, cy) - 1
             if not (0 <= column < len(xs) - 1 and 0 <= row < len(ys) - 1):
                 continue
             cells.setdefault((row, column), []).append((str(text).strip(), float(score)))
+            # A center alone can assign clipped/merged text to the wrong column.
+            # Require the full OCR box to stay in the detected cell and viewport.
+            if (points[:, 0].min() < xs[column] - 2 or points[:, 0].max() > xs[column + 1] + 2
+                    or points[:, 1].min() < ys[row] - 2 or points[:, 1].max() > ys[row + 1] + 2
+                    or points[:, 0].min() <= 0 or points[:, 0].max() >= image.width - 1):
+                clipped_cells.add((row, column))
         headers = {}
+        warnings = []
         relevant = {"symbol", "name", "available_quantity", "position_quantity", "current_price", "market_value"} if role == "positions" else set(ALIASES)
         known_headers = set().union(*(ALIASES[field] for field in relevant))
         for column in range(len(xs) - 1):
@@ -201,8 +212,13 @@ class OcrTableReader:
             recognized = [text for text, score in candidates if text in known_headers]
             if not recognized:
                 continue
+            optional = role == "positions" and any(text in ALIASES[f] for text in recognized for f in DISPLAY_FIELDS)
+            if optional and (len(candidates) != 1 or candidates[0][1] < self.confidence or (0, column) in clipped_cells):
+                continue
             if len(candidates) > 1:
                 raise ValidationError("表头跨列或包含多个识别片段")
+            if (0, column) in clipped_cells:
+                raise ValidationError("必需表头跨列或被截断；请展开窗口和列宽后重新读取")
             if candidates:
                 text, score = candidates[0]
                 if score < self.confidence:
@@ -213,6 +229,10 @@ class OcrTableReader:
         present = {field for field, aliases in ALIASES.items() if aliases.intersection(headers.values())}
         if not REQUIRED[role].issubset(present):
             raise ValidationError("OCR缺少必需表头，可能尚未加载或列被隐藏")
+        if role == "positions":
+            for name, label in (("current_price", "市价"), ("market_value", "市值")):
+                if name not in present:
+                    warnings.append(f"未可靠识别{label}列，显示—；请展开客户端窗口及列宽，重新适配检查")
         rows = []
         for row in range(1, len(ys) - 1):
             tokens = [(text, score) for (cell_row, _), values in cells.items() if cell_row == row
@@ -228,11 +248,25 @@ class OcrTableReader:
             if (len(first_cell) == 1 and first_cell[0][0] == "汇总" and first_cell[0][1] >= self.confidence
                     and all(text in {"", "汇总"} for text in symbol_texts)):
                 continue
-            raw = {}
+            raw, row_warnings = {}, []
             for column, header in headers.items():
                 candidates = cells.get((row, column), [])
+                optional = role == "positions" and any(header in ALIASES[f] for f in DISPLAY_FIELDS)
+                if optional:
+                    if (len(candidates) != 1 or candidates[0][1] < self.confidence or (row, column) in clipped_cells):
+                        row_warnings.append(f"{header}缺失、低置信或跨列，显示—；请展开列宽")
+                        continue
+                    try:
+                        number = Decimal(candidates[0][0])
+                        if not number.is_finite() or number < 0:
+                            raise InvalidOperation
+                    except InvalidOperation:
+                        row_warnings.append(f"{header}不能可靠解析，显示—；请重新读取")
+                        continue
                 if len(candidates) > 1:
                     raise ValidationError("单元格包含多个识别片段，拒绝猜测拼接")
+                if (row, column) in clipped_cells:
+                    raise ValidationError("持仓/委托字段跨列或被截断；请展开窗口和列宽后重新读取")
                 if candidates and candidates[0][1] < self.confidence:
                     raise ValidationError(f"OCR低置信度字段: {candidates[0][0]}")
                 raw[header] = candidates[0][0] if candidates else ""
@@ -240,5 +274,21 @@ class OcrTableReader:
                 continue
             # Only grade/normalize columns needed for this role. Unrelated clipped columns
             # are retained in raw but do not participate in trade identifiers or status.
-            rows.append(normalize(raw, role))
-        return TableSnapshot(role, rows, observed_at, "ocr", complete=False)
+            normalized = normalize(raw, role)
+            if role == "positions" and {"position_quantity", "current_price", "market_value"}.issubset(normalized):
+                price, value = Decimal(normalized["current_price"]), Decimal(normalized["market_value"])
+                quantity = normalized["position_quantity"]
+                # Account for rounding of both displayed numbers. This catches
+                # lost decimal points without fabricating a replacement price.
+                tolerance = (Decimal(1).scaleb(price.as_tuple().exponent) * quantity
+                             + Decimal(1).scaleb(value.as_tuple().exponent)) / 2 + Decimal("0.01")
+                if abs(price * quantity - value) > tolerance:
+                    normalized.pop("current_price")
+                    normalized.pop("market_value")
+                    row_warnings.append("市价×总持仓与市值不一致，市价/市值显示—；请核对客户端列宽与小数点")
+            if row_warnings:
+                normalized["read_warnings"] = row_warnings
+                warnings.extend(f"{normalized['symbol']}：{message}" for message in row_warnings)
+            rows.append(normalized)
+        return TableSnapshot(role, rows, observed_at, "ocr", complete=False, warnings=list(dict.fromkeys(warnings)),
+                             layout={"image_size": [image.width, image.height], "headers": list(headers.values())})

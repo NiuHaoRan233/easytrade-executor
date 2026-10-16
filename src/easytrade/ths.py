@@ -92,7 +92,8 @@ class ThsDraftAdapter:
     @read_step("connect")
     def connect(self):
         self._attach()
-        self.main.restore()
+        # set_focus already restores a minimized window, preserving whether it
+        # was maximized. Unconditional SW_RESTORE changes the user's layout.
         self.main.set_focus()
         self._assert_identity()
 
@@ -241,16 +242,34 @@ class ThsDraftAdapter:
             self._assert_identity()
             try:
                 grid = self._control(self.profile.get("grid_control_id", 1047), self.profile.get("grid_class", "CVirtualGridCtrl"))
+                geometry = self._table_geometry(grid)
                 picture = measure(self, "table_capture", grid.capture_as_image)
                 scale = self.ocr_scales.get(role, 1)
                 if scale != 1:
                     picture = picture.resize((picture.width * scale, picture.height * scale))
                 result = measure(self, "table_ocr_parse", lambda: self.reader.read(picture, role, utc_now().isoformat()))
+                self._assert_identity()
+                if geometry != self._table_geometry(grid):
+                    raise ValidationError("读取期间客户端窗口大小、表格范围或DPI发生变化；请固定布局后重新读取")
+                result.layout.update(geometry, ocr_scale=scale)
                 return result
             except Exception as error:
                 last_error = error
                 time.sleep(0.15)
         raise PreparationError(f"表格未就绪或不能可靠识别: {last_error}")
+
+    def _table_geometry(self, grid):
+        """Relative geometry survives moving a window, but detects resize/DPI changes."""
+        outer, rect = self.main.rectangle(), grid.rectangle()
+        dpi = None
+        try:
+            import ctypes
+            dpi = ctypes.windll.user32.GetDpiForWindow(self.main.handle) or None
+        except (AttributeError, OSError):
+            pass
+        return {"window_size": [outer.width(), outer.height()],
+                "grid_box": [rect.left - outer.left, rect.top - outer.top,
+                             rect.right - outer.left, rect.bottom - outer.top], "dpi": dpi}
 
     def read_quote(self, symbol, instrument):
         """Read the native quote panel; only fill the symbol, never a submit action."""
@@ -359,6 +378,8 @@ class ThsDraftAdapter:
                 "positions_complete": positions.complete,
                 "positions_scope": "all_scroll_pages" if positions.complete else "visible_rows",
                 "positions_incomplete_reason": positions.incomplete_reason,
+                "positions_read_warnings": positions.warnings,
+                "positions_layout": positions.layout,
                 "positions_observed_at": positions.observed_at}
 
     @staticmethod
@@ -426,7 +447,7 @@ class ThsDraftAdapter:
         self._assert_identity()
         scroller.scroll("up", "end")
         self._wait(lambda: self._scroll_info(scroller)[3] == self._scroll_info(scroller)[0], f"{label}表未滚动到首行")
-        rows, seen_positions, extent = {}, set(), None
+        rows, seen_positions, extent, warnings, layout = {}, set(), None, [], None
         for _ in range(100):
             self._assert_identity()
             before = self._scroll_info(scroller)
@@ -435,6 +456,10 @@ class ThsDraftAdapter:
             if before[:3] != extent or before[3] in seen_positions:
                 raise ValidationError(f"{label}滚动范围变化或重复，请重新刷新")
             snapshot = self.read_table(role)
+            if layout is not None and any(layout.get(k) != snapshot.layout.get(k) for k in ("window_size", "grid_box", "dpi")):
+                raise ValidationError(f"分页期间{label}窗口布局变化，请固定窗口后重新读取")
+            layout = snapshot.layout
+            warnings.extend(snapshot.warnings)
             if self._scroll_info(scroller) != before:
                 raise ValidationError(f"读取期间{label}表发生滚动，请重新刷新")
             page_symbols = set()
@@ -454,7 +479,8 @@ class ThsDraftAdapter:
             if page <= 0:
                 raise ValidationError(f"{label}滚动条未提供有效页大小，不能确认完整性")
             if position >= max(minimum, maximum - page + 1):
-                return TableSnapshot(role, list(rows.values()), snapshot.observed_at, snapshot.source, complete=True)
+                return TableSnapshot(role, list(rows.values()), snapshot.observed_at, snapshot.source, complete=True,
+                                     warnings=list(dict.fromkeys(warnings)), layout=layout)
             self._assert_identity()
             # One line at a time keeps the previous viewport overlapping even
             # when THS expresses scrollbar units in pixels rather than rows.

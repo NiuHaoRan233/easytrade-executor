@@ -5,7 +5,7 @@ from unittest.mock import patch
 from decimal import Decimal
 from types import SimpleNamespace
 
-from easytrade.domain import Instrument, Signal, build_plan
+from easytrade.domain import Instrument, Signal, build_plan, ValidationError
 from easytrade.tables import TableSnapshot
 from easytrade.ths import ThsDraftAdapter
 from test_executor import signal
@@ -176,6 +176,47 @@ class ThsContractTests(unittest.TestCase):
         adapter.main = Window()
         adapter.main.page = profile["pages"]["buy"]
         return adapter
+
+    def test_connect_does_not_restore_a_user_sized_or_maximized_window(self):
+        adapter = self.make_adapter()
+        adapter._attach = lambda: None
+        with patch.object(adapter.main, "restore") as restore, patch.object(adapter.main, "set_focus") as focus:
+            adapter.connect()
+        restore.assert_not_called()
+        focus.assert_called_once()
+
+    def test_read_table_discards_a_capture_if_the_window_resizes_during_ocr(self):
+        from PIL import Image
+        from unittest.mock import Mock
+        adapter = self.make_adapter()
+        adapter.timeout = 1
+        adapter._page = lambda path: None
+        adapter._assert_identity = lambda: None
+        grid = SimpleNamespace(capture_as_image=lambda: Image.new("RGB", (300, 100)))
+        adapter._control = lambda *args: grid
+        before, after = {"window_size": [800, 600]}, {"window_size": [1000, 700]}
+        adapter._table_geometry = Mock(side_effect=[before, after, after, after])
+        first, second = (TableSnapshot("positions", [], "now", "ocr") for _ in range(2))
+        adapter.reader.read = Mock(side_effect=[first, second])
+        result = adapter.read_table("positions")
+        self.assertIs(result, second)
+        self.assertEqual(result.layout["window_size"], [1000, 700])
+        self.assertEqual(adapter.reader.read.call_count, 2)
+
+    def test_pagination_keeps_price_warnings_from_all_pages(self):
+        adapter, state, rows = self.position_reader()
+        adapter.read_table = lambda role: TableSnapshot(role, rows[state["position"]:state["position"] + 2], "now", "ocr",
+            warnings=[f"page-{state['position']} missing price"], layout={"window_size": [1000, 700]})
+        result = adapter.read_positions()
+        self.assertEqual(len(result.warnings), 3)
+        self.assertTrue(result.complete)
+
+    def test_pagination_rejects_a_changed_window_layout(self):
+        adapter, state, rows = self.position_reader()
+        adapter.read_table = lambda role: TableSnapshot(role, rows[state["position"]:state["position"] + 2], "now", "ocr",
+            layout={"window_size": [1000 + state["position"], 700]})
+        with self.assertRaisesRegex(ValidationError, "窗口布局变化"):
+            adapter.read_positions()
 
     def test_buy_and_sell_prepare_without_submit(self):
         instrument = Instrument("盈峰环境", 100, Decimal("0.01"))

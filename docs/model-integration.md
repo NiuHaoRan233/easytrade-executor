@@ -62,6 +62,8 @@ URI 中编号须 URL 编码。当前每个服务/账本对应一个配置账户�
 
 账户重点字段：`balances.available_cash`、`positions`、`positions_complete`、`positions_scope`、`observed_at`。实盘持仓代码通常为六位原始代码，模型应结合实际市场映射，不要假设都有后缀。委托快照有 `rows`、`complete`、`incomplete_reason`；不完整不代表空账户。
 
+实盘账户还包含 `positions_read_warnings` 和 `positions_layout`（窗口大小、表格相对范围、DPI、OCR缩放、已识别列）。单行可含 `read_warnings`。被截断、缺失、低置信或明显矛盾的 `current_price`/`market_value` 会省略；缺失不表示零，也不应复用旧价格。持仓范围完整与价格字段可靠是两个不同维度。模型接入前在测试台完成[本机适配检查](client-adaptation.md)。
+
 ## 状态与超时
 
 - `BROKER_ACCEPTED`：已受理，不等于成交。

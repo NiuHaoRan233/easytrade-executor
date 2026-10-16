@@ -43,6 +43,7 @@ class Console:
         self.quote_text = tk.StringVar(value="模拟盘口：买一1.400 / 卖一1.401（固定样本，非实时）")
         self.account_text = tk.StringVar(value="账户与持仓尚未读取")
         self.broker_text = tk.StringVar(value="券商当日委托尚未读取")
+        self.check_text = tk.StringVar(value="首次使用：先固定客户端窗口及列宽，切换实盘后点击“客户端适配检查”。\n只读检查，不发送买卖或撤单；完成后仍需人工逐项对照。")
         root.title("Easytrade 通用交易测试台")
         root.geometry("1100x780")
         root.minsize(920, 700)
@@ -92,7 +93,7 @@ class Console:
         self.trade_buttons = []
         self.action_buttons = {}
         for label, action in (("刷新盘口", "quote"), ("买入", "buy"), ("卖出", "sell"),
-                              ("刷新账户/持仓", "account"), ("刷新委托状态", "refresh")):
+                              ("刷新账户/持仓", "account"), ("刷新委托状态", "refresh"), ("客户端适配检查", "check")):
             button = ttk.Button(actions, text=label, command=lambda a=action: self.start(a))
             button.pack(side="left", padx=(0, 8))
             self.buttons.append(button)
@@ -110,6 +111,15 @@ class Console:
         self.tabs.add(broker_tab, text="券商当日委托")
         self.tabs.add(account_tab, text="账户与持仓")
         self.tabs.add(quote_tab, text="行情与五档")
+        self.check_tab = ttk.Frame(self.tabs)
+        self.tabs.add(self.check_tab, text="首次适配检查")
+        self.check_view = tk.Text(self.check_tab, wrap="word", height=10, padx=12, pady=12, state="disabled")
+        check_scroll = ttk.Scrollbar(self.check_tab, orient="vertical", command=self.check_view.yview)
+        self.check_view.configure(yscrollcommand=check_scroll.set)
+        check_scroll.pack(side="right", fill="y")
+        self.check_view.pack(side="left", fill="both", expand=True)
+        self.check_text.trace_add("write", self.render_check_text)
+        self.render_check_text()
         ttk.Label(broker_tab, textvariable=self.broker_text, wraplength=1000).pack(anchor="w", padx=8, pady=8)
         self.broker_table = ttk.Treeview(broker_tab, columns=("symbol", "side", "quantity", "price", "status", "filled", "average", "broker"), show="headings")
         for key, label, width in zip(("symbol", "side", "quantity", "price", "status", "filled", "average", "broker"),
@@ -170,9 +180,15 @@ class Console:
         root.after(80, self.poll)
         self.start("list")
 
+    def render_check_text(self, *args):
+        self.check_view.configure(state="normal")
+        self.check_view.delete("1.0", "end")
+        self.check_view.insert("1.0", self.check_text.get())
+        self.check_view.configure(state="disabled")
+
     def change_banner(self):
         live = self.mode.get().startswith("实盘")
-        self.banner.set("实盘：按钮将提交所选证券、数量与限价；资金和可卖数量最终由券商核验。\n未知弹窗保留现场；请先查询账户，首次适配在模拟和只读查询中核对。" if live else
+        self.banner.set("实盘：按钮将提交所选证券、数量与限价；资金和可卖数量最终由券商核验。\n首次先做客户端适配检查；运行时保持客户端大小/列宽/缩放，调整后重新检查。" if live else
                         "模拟模式：独立模拟资金及固定样本报价，买卖仅修改本地模拟账本。\n模拟不验证实际T+1可卖限制；切换实盘后，按钮才操作交易客户端。")
         self.banner_label.configure(bg="#fce8e6" if live else "#e7f1ea", fg="#9c2018" if live else "#225a34")
 
@@ -194,6 +210,7 @@ class Console:
                 table.delete(item)
         self.broker_text.set("券商当日委托尚未读取")
         self.account_text.set("账户与持仓尚未读取")
+        self.check_text.set("切换模式后需重新检查。客户端适配检查只读取账户与当日委托，不会发单。\n新电脑、客户端升级、窗口/列宽/DPI调整后，请检查并人工对照价格小数点与完整编号。")
         for item in self.positions_table.get_children():
             self.positions_table.delete(item)
         self.pending_hint.set("")
@@ -394,6 +411,13 @@ class Console:
                         snapshot = session.account_snapshot()
                         self.messages.put(("account", snapshot))
                         record_action(self.project_root, "account_snapshot", live=live, snapshot=snapshot)
+                    elif action == "check":
+                        report = session.check_client()
+                        if report["account_snapshot"] is not None:
+                            self.messages.put(("account", report["account_snapshot"]))
+                        if report["broker_snapshot"] is not None:
+                            self.messages.put(("broker_orders", report["broker_snapshot"]))
+                        self.messages.put(("client_check", report))
                 except Exception as error:
                     if isinstance(error, QuoteUnavailable) or task["action"] == "quote":
                         self.messages.put(("quote", "盘口定价当前不可用：" + str(error)))
@@ -463,13 +487,22 @@ class Console:
                     self.account_text.set(f"账户 {value['account']} | 资金余额 {balances.get('cash_balance', '—')} | 可用资金 {balances['available_cash']} | 冻结 {balances.get('frozen_cash', '—')} | "
                         f"股票市值 {balances.get('stock_value', '—')} | 总资产 {balances.get('total_assets', '—')}\n"
                         f"来源 {value['source']} | {value['observed_at']} | {scope}，共{len(value['positions'])}项"
-                        + ("\n未确认完整性：" + value["positions_incomplete_reason"] if value.get("positions_incomplete_reason") else ""))
+                        + ("\n未确认完整性：" + value["positions_incomplete_reason"] if value.get("positions_incomplete_reason") else "")
+                        + ("\n显示提示：" + "；".join(value["positions_read_warnings"][:3]) if value.get("positions_read_warnings") else ""))
                     for item in self.positions_table.get_children():
                         self.positions_table.delete(item)
                     for row in value["positions"]:
                         self.positions_table.insert("", "end", values=(row["symbol"], row.get("name", "—"), row["position_quantity"],
                             row["available_quantity"], row.get("current_price", "—"), row.get("market_value", "—")))
                     self.tabs.select(self.account_tab)
+                elif kind == "client_check":
+                    layout = value["layout"]
+                    geometry = f"窗口大小 {layout.get('window_size', '未取得')}；DPI {layout.get('dpi') or '未取得'}；表格范围 {layout.get('grid_box', '未取得')}"
+                    self.check_text.set(("模拟检查不代表实际客户端已适配。\n" if value['mode'] == 'paper' else "只读检查完成，未发送买卖或撤单。\n")
+                        + geometry + "\n检查时间 " + value['observed_at'] + "\n\n"
+                        + "\n\n".join(f"{row['item']}：{row['status']}\n{row['detail']}" for row in value['checks'])
+                        + "\n\n人工核对一致后保持此布局；窗口、列宽、显示缩放、显示器或客户端版本变化后重新检查。报告仅保存在本机 runtime/client-check-*.json。")
+                    self.tabs.select(self.check_tab)
                 elif kind == "account_error":
                     self.account_text.set("本次读取失败：" + value + "\n下方若有数据，仅为上次成功快照，请核对其原时间。\n" + self.account_text.get())
                 elif kind == "orders":

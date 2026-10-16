@@ -85,6 +85,33 @@ class GatewayTests(unittest.TestCase):
         self.assertFalse(self.native.prepared)
         self.assertFalse(self.native.submitted)
 
+    def test_client_check_reports_layout_and_warnings_without_any_trading(self):
+        from easytrade.tables import TableSnapshot
+        original = self.native.read_account
+        def account():
+            value = original()
+            value["positions_read_warnings"] = ["市价列被截断"]
+            value["positions_layout"] = {"window_size": [1200, 800], "dpi": 144}
+            return value
+        self.native.read_account = account
+        self.native.read_orders = lambda: TableSnapshot("orders", [], "now", "ocr", complete=True)
+        report = self.session.check_client()
+        self.assertFalse(report["submitted"])
+        self.assertTrue(report["manual_review_required"])
+        self.assertEqual(report["layout"]["dpi"], 144)
+        self.assertEqual(next(row for row in report["checks"] if row["item"] == "持仓市价与市值")["status"], "需调整")
+        self.assertTrue((Path(self.tmp.name) / "runtime/client-check-live.json").is_file())
+        self.assertFalse(self.native.prepared or self.native.submitted or self.native.cancelled or self.native.resumed)
+
+    def test_client_check_keeps_errors_and_never_claims_an_empty_account_passed(self):
+        self.native.read_account = lambda: (_ for _ in ()).throw(ValidationError("missing table"))
+        self.native.read_orders = lambda: (_ for _ in ()).throw(ValidationError("identity mismatch"))
+        report = self.session.check_client()
+        self.assertIsNone(report["account_snapshot"])
+        self.assertEqual([r["status"] for r in report["checks"][:2]], ["读取失败", "读取失败"])
+        self.assertTrue(report["manual_review_required"])
+        self.assertFalse(self.native.submitted)
+
     def test_signal_expiring_during_account_read_does_not_fill_fields(self):
         raw = message()
         future = utc_now() + timedelta(minutes=3)
