@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "easytrade-executor"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local THS trading gateway with model signal API, account queries and desktop test console"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
+test = ["Pillow>=10", "numpy>=1.26"]
 windows = ["pywinauto==0.6.9", "pywin32>=306"]
 ocr = ["rapidocr==3.10.0", "onnxruntime>=1.20", "Pillow>=10", "opencv-python-headless>=4.10"]
 
