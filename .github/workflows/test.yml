@@ -32,7 +32,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - if: matrix.python == '3.13'
-        run: python -m pip install --only-binary=:all: -c constraints/windows-py313-tested.txt -e ".[windows,ocr]"
+        run: >-
+          python -m pip install --only-binary=:all: -c constraints/windows-py313-tested.txt -e ".[windows,ocr]"
       - if: matrix.python != '3.13'
-        run: python -m pip install --only-binary=:all: -e ".[windows,ocr]"
+        run: >-
+          python -m pip install --only-binary=:all: -e ".[windows,ocr]"
       - run: python -X utf8 -m easytrade.doctor --mode paper --warm-ocr --json
