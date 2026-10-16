@@ -7,4 +7,6 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 ".venv\Scripts\python.exe" -X utf8 -m easytrade.doctor --init-config %*
+set "ET_CONFIG_EXIT=%ERRORLEVEL%"
 pause
+exit /b %ET_CONFIG_EXIT%

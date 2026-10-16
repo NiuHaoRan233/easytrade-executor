@@ -11,4 +11,6 @@ if exist ".venv\Scripts\python.exe" (
     py -3 -X utf8 tools\check_environment.py %*
   )
 )
+set "ET_CHECK_EXIT=%ERRORLEVEL%"
 pause
+exit /b %ET_CHECK_EXIT%
