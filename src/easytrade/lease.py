@@ -32,4 +32,3 @@ def session_lease(path: str | Path):
                 msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-

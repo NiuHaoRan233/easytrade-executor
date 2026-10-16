@@ -1,4 +1,3 @@
-"""Execution prototype. Importing the package never controls a desktop."""
+"""Local model execution gateway. Importing never controls a desktop."""
 
-__version__ = "0.1.0"
-
+__version__ = "0.2.0"

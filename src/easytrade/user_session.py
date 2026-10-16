@@ -427,4 +427,3 @@ class UserSession:
                 "cancel_sent": False, "submitted": False})
             self._log_order(result)
             return result
-

@@ -57,4 +57,3 @@ class Client:
     def cancel(self, signal_id):
         from urllib.parse import quote
         return self.request("/orders/" + quote(signal_id, safe="") + "/cancel", {})
-

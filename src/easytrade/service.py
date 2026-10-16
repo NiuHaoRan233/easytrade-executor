@@ -122,4 +122,3 @@ def create_server(executor: Executor, token: str, port: int = 8765) -> HTTPServe
     # One thread owns the Windows adapter for its entire lifetime. Requests queue
     # in the socket backlog; no GUI operations from concurrent request threads.
     return HTTPServer(("127.0.0.1", port), Handler)
-

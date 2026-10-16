@@ -8,7 +8,7 @@ import zipfile
 
 
 FIXED = (
-    ".gitignore", ".github/workflows/test.yml", "README.md", "CHANGELOG.md", "pyproject.toml",
+    ".gitignore", ".gitattributes", ".github/workflows/test.yml", "README.md", "CHANGELOG.md", "pyproject.toml",
     "Setup.cmd", "Start-Test-Console.cmd", "Start-Paper-Service.cmd", "Start-Live-Service.cmd",
     "config/paper.example.json", "config/ths.example.json",
     "docs/quickstart.md", "docs/local-test-console.md", "docs/model-integration.md", "docs/architecture.md",
